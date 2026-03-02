@@ -12,6 +12,7 @@ from urllib.request import Request as UrlRequest, urlopen
 
 from dotenv import load_dotenv
 from fasthtml.common import *
+from monsterui.all import *
 
 
 ROOT = Path(__file__).resolve().parent
@@ -225,10 +226,102 @@ app_state = WikiGraphApp()
 
 app, rt = fast_app(
     title="TubeMind Wikipedia GraphRAG",
-    pico=True,
+    pico=False,
     hdrs=(
+        *Theme.zinc.headers(
+            mode="light",
+            radii=ThemeRadii.lg,
+            shadows=ThemeShadows.md,
+            font=ThemeFont.default,
+        ),
         Style(
             """
+            :root {
+                --page-glow: radial-gradient(circle at top left, hsla(var(--primary), 0.24), transparent 34%);
+                --page-glow-secondary: radial-gradient(circle at top right, rgba(255, 255, 255, 0.82), transparent 38%);
+                --page-base: linear-gradient(180deg, #fffdf8 0%, #f5f1e7 100%);
+                --panel-border: rgba(73, 57, 31, 0.10);
+                --panel-shadow: 0 22px 60px rgba(73, 57, 31, 0.10);
+            }
+            body {
+                min-height: 100vh;
+                background:
+                    var(--page-glow),
+                    var(--page-glow-secondary),
+                    var(--page-base);
+                color: #201811;
+            }
+            main.tubemind-shell {
+                max-width: 980px;
+                margin: 0 auto;
+                padding: 2rem 1.25rem 4rem;
+            }
+            .tm-app-grid,
+            .tm-panel {
+                border: 1px solid var(--panel-border);
+                border-radius: 1.5rem;
+                background: rgba(255, 255, 255, 0.74);
+                backdrop-filter: blur(14px);
+                box-shadow: 0 14px 40px rgba(73, 57, 31, 0.08);
+            }
+            .tm-app-grid {
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 1.1rem;
+            }
+            .tm-panel {
+                padding: 1.4rem;
+            }
+            .tm-panel h2 {
+                margin-bottom: 0.5rem;
+                font-size: 1.45rem;
+                line-height: 1.1;
+            }
+            .tm-panel p {
+                color: rgba(32, 24, 17, 0.72);
+            }
+            .tm-panel form {
+                display: grid;
+                gap: 0.9rem;
+                margin-top: 1rem;
+            }
+            .tm-panel textarea,
+            .tm-panel select {
+                border-radius: 1rem;
+                border: 1px solid rgba(73, 57, 31, 0.14);
+                background: rgba(255, 252, 247, 0.92);
+            }
+            .tm-panel textarea {
+                min-height: 138px;
+            }
+            .tm-panel button {
+                justify-content: center;
+                min-height: 3rem;
+                font-weight: 700;
+            }
+            #response-area pre {
+                margin-top: 1rem;
+                padding: 1.15rem;
+                white-space: pre-wrap;
+                border-radius: 1.2rem;
+                background: rgba(27, 23, 18, 0.94);
+                color: #fff7ea;
+                box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+            }
+            .tm-response {
+                margin-top: 1.5rem;
+                padding: 1.5rem;
+            }
+            .tm-response details {
+                margin-top: 1rem;
+                overflow: hidden;
+                border-radius: 1rem;
+                background: rgba(255, 255, 255, 0.68);
+            }
+            .tm-response ul {
+                margin: 0;
+                padding: 0 1rem 1rem 2.2rem;
+            }
             .htmx-indicator {
                 display: none;
             }
@@ -236,8 +329,10 @@ app, rt = fast_app(
             .htmx-request .htmx-indicator {
                 display: block;
             }
-            #response-area pre {
-                white-space: pre-wrap;
+            @media (max-width: 920px) {
+                .tm-app-grid {
+                    grid-template-columns: 1fr;
+                }
             }
             """
         ),
@@ -248,102 +343,175 @@ app, rt = fast_app(
 
 
 def page_main(*content: Any):
+    """Render the full application shell.
+
+    This function intentionally renders only the interactive application
+    surface: the two workflow forms and the response area. HTMX swaps replace
+    the full `main` element, so this wrapper keeps the form layout stable
+    without reintroducing decorative hero content or nonessential controls.
+    """
     state = app_state.state
+    seed_button_label = "Index corpus and answer" if not state.indexed else "Corpus already indexed"
+    query_button_cls = "uk-btn uk-btn-primary"
+    seed_button_cls = "uk-btn uk-btn-primary"
     return Main(
-        Header(
-            H1("TubeMind Wikipedia GraphRAG"),
-            P(
-                "Index Wikipedia once into LightRAG, then keep querying the existing graph and corpus without reindexing."
-            ),
-        ),
-        status_panel(),
-        Article(
-            H2("Seed Corpus"),
-            P(
-                "This searches Wikipedia, indexes the returned articles into LightRAG, and answers the first question."
-            ),
-            Form(
-                Label("Wikipedia topic or search phrase", _for="seed_query"),
-                Textarea(
-                    state.seed_query or "",
-                    id="seed_query",
-                    name="seed_query",
-                    placeholder="Example: Ada Lovelace and the analytical engine",
-                    disabled=state.indexed,
+        Div(
+            Card(
+                H2("Seed the knowledge base"),
+                P(
+                    "Search Wikipedia, pull the top articles into LightRAG, and generate the first answer from the newly built graph."
                 ),
-                Button("Index corpus and answer", type="submit", disabled=state.indexed),
-                Small("Indexing is one-time. After completion, this form stays disabled."),
-                hx_post="/seed",
-                hx_target="main",
-                hx_swap="outerHTML",
-                hx_indicator="#seed-indicator",
-            ),
-            Article(
-                P("Indexing in progress. The page will update when the corpus is ready.", aria_busy="true"),
-                id="seed-indicator",
-                cls="htmx-indicator",
-            ),
-        ),
-        Article(
-            H2("Query Existing Corpus"),
-            P("These follow-up questions only query the saved LightRAG index."),
-            Form(
-                Label("Question", _for="query"),
-                Textarea(
-                    "",
-                    id="query",
-                    name="query",
-                    placeholder="Ask about the indexed Wikipedia corpus",
+                Form(
+                    Label("Wikipedia topic or search phrase", _for="seed_query"),
+                    Textarea(
+                        state.seed_query or "",
+                        id="seed_query",
+                        name="seed_query",
+                        placeholder="Example: Ada Lovelace and the analytical engine",
+                        disabled=state.indexed,
+                    ),
+                    Small("Indexing is intentionally one-time for this demo so follow-up questions stay fast and deterministic."),
+                    Button(
+                        seed_button_label,
+                        type="submit",
+                        disabled=state.indexed,
+                        cls=seed_button_cls,
+                        hx_post="/seed",
+                        hx_target="main",
+                        hx_swap="outerHTML",
+                        hx_indicator="#seed-indicator",
+                    ),
                 ),
-                Label("Retrieval mode", _for="mode"),
-                Select(
-                    *[
-                        Option(mode.upper(), value=mode, selected=mode == DEFAULT_QUERY_MODE)
-                        for mode in QUERY_MODES
-                    ],
-                    id="mode",
-                    name="mode",
-                    disabled=not state.indexed,
+                Div(
+                    P("Indexing in progress. The page will refresh with the answer when the corpus is ready.", aria_busy="true"),
+                    id="seed-indicator",
+                    cls="htmx-indicator mt-3 text-sm text-[#6a5744]",
                 ),
-                Button("Query graph", type="submit", disabled=not state.indexed),
-                hx_post="/query",
-                hx_target="main",
-                hx_swap="outerHTML",
-                hx_indicator="#query-indicator",
+                cls="tm-panel",
             ),
-            Article(
-                P("Query in progress. Results will replace the page content below.", aria_busy="true"),
-                id="query-indicator",
-                cls="htmx-indicator",
+            Card(
+                H2("Query the existing graph"),
+                P("Use the saved corpus for repeated analysis without paying the indexing cost again."),
+                Form(
+                    Label("Question", _for="query"),
+                    Textarea(
+                        "",
+                        id="query",
+                        name="query",
+                        placeholder="Ask about the indexed Wikipedia corpus",
+                    ),
+                    Label("Retrieval mode", _for="mode"),
+                    Select(
+                        *[
+                            Option(mode.upper(), value=mode, selected=mode == DEFAULT_QUERY_MODE)
+                            for mode in QUERY_MODES
+                        ],
+                        id="mode",
+                        name="mode",
+                        disabled=not state.indexed,
+                    ),
+                    Small("`mix` is the default because it balances graph context with direct chunk retrieval."),
+                    Button(
+                        "Query graph",
+                        type="submit",
+                        disabled=not state.indexed,
+                        cls=query_button_cls,
+                        hx_post="/query",
+                        hx_target="main",
+                        hx_swap="outerHTML",
+                        hx_indicator="#query-indicator",
+                    ),
+                ),
+                Div(
+                    P("Query in progress. Results will replace the response panel below.", aria_busy="true"),
+                    id="query-indicator",
+                    cls="htmx-indicator mt-3 text-sm text-[#6a5744]",
+                ),
+                cls="tm-panel",
             ),
+            cls="tm-app-grid",
         ),
-        Section(*content, id="response-area") if content else response_panel(),
-        cls="container",
+        *content if content else (response_panel(),),
+        cls="tubemind-shell",
     )
 
 
 def layout(*content: Any):
+    """Wrap the rendered page body with the document title.
+
+    Keeping title generation separate from `page_main` lets both full-page and
+    HTMX responses share the same content builder while only full navigations
+    emit document-level metadata.
+    """
     return Title("TubeMind Wikipedia GraphRAG"), page_main(*content)
 
 
 def status_panel() -> Any:
+    """Render the compact corpus status panel.
+
+    This panel exists outside the forms so both workflows can reference the
+    current application state at a glance. It highlights whether indexing has
+    already happened, what seed query produced the corpus, and how many source
+    articles are available for retrieval.
+    """
     state = app_state.state
     if state.indexed:
-        return Article(
-            Header(H2("Index Ready")),
-            P("Indexing is complete. Future questions use the existing LightRAG corpus only."),
-            Ul(
-                Li(f"Seed query: {state.seed_query}"),
-                Li(f"Stored articles: {len(state.indexed_titles)}"),
+        return Card(
+            H2("Corpus status"),
+            P("Indexing is complete. Every follow-up question now reuses the existing LightRAG corpus."),
+            Div(
+                Div(
+                    Strong("State"),
+                    Span("Ready"),
+                    cls="tm-status-pill",
+                ),
+                Div(
+                    Strong("Seed query"),
+                    Span(state.seed_query),
+                    cls="tm-status-pill",
+                ),
+                Div(
+                    Strong("Stored articles"),
+                    Span(str(len(state.indexed_titles))),
+                    cls="tm-status-pill",
+                ),
+                cls="tm-status-row",
             ),
+            cls="tm-panel mt-6",
         )
-    return Article(
-        Header(H2("Index Not Built")),
-        P("No Wikipedia corpus has been indexed yet. Use the seed form once to create it."),
+    return Card(
+        H2("Corpus status"),
+        P("No Wikipedia corpus has been indexed yet. Seed the graph once to unlock the follow-up query workflow."),
+        Div(
+            Div(
+                Strong("State"),
+                Span("Waiting"),
+                cls="tm-status-pill",
+            ),
+            Div(
+                Strong("Seed query"),
+                Span("Not set"),
+                cls="tm-status-pill",
+            ),
+            Div(
+                Strong("Stored articles"),
+                Span("0"),
+                cls="tm-status-pill",
+            ),
+            cls="tm-status-row",
+        ),
+        cls="tm-panel mt-6",
     )
 
 
 def details_block(titles: list[str]) -> Any:
+    """Render the source article list for the current response.
+
+    The response section can show both newly inserted titles and the full saved
+    corpus. Keeping the source list in a collapsible block preserves a clean
+    primary reading experience while still exposing traceability when the user
+    wants to inspect the indexed material.
+    """
     return Details(
         Summary("Indexed articles"),
         Ul(
@@ -362,11 +530,20 @@ def response_panel(
     answer: str = "",
     titles: list[str] | None = None,
 ) -> Any:
-    return Article(
-        Header(H2(heading)),
+    """Render the bottom response surface for success, idle, and error states.
+
+    This single component is used for the initial empty state, seed results,
+    follow-up answers, and exception messages. Consolidating those states keeps
+    HTMX updates simple and ensures all outcomes share the same visual treatment
+    and source-link affordances.
+    """
+    return Card(
+        H2(heading),
         P(message),
         Pre(answer) if answer else "",
         details_block(titles or []) if titles else "",
+        id="response-area",
+        cls="tm-panel tm-response",
     )
 
 

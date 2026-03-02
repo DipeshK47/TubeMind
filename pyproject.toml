@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "lightrag-hku>=1.4.10",
+    "monsterui>=1.0.44",
     "openai>=2.24.0",
     "python-dotenv>=1.2.1",
     "python-fasthtml>=0.12.47",

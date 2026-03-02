@@ -226,5 +226,47 @@
     "create_time": 1772429204,
     "update_time": 1772429204,
     "_id": "mix:query:a2220581188a22810abc0c1529abc394"
+  },
+  "mix:keywords:70eea45f713ba7d41cecfe12b6c4c024": {
+    "return": "{\"high_level_keywords\": [\"Fate of Calpyso\", \"Status of Calpyso\", \"What happened to Calpyso\"], \"low_level_keywords\": [\"Calpyso\"]}",
+    "cache_type": "keywords",
+    "chunk_id": null,
+    "original_prompt": "what happened to calpyso",
+    "queryparam": {
+      "mode": "mix",
+      "response_type": "Multiple Paragraphs",
+      "top_k": 40,
+      "chunk_top_k": 20,
+      "max_entity_tokens": 6000,
+      "max_relation_tokens": 8000,
+      "max_total_tokens": 30000,
+      "user_prompt": "",
+      "enable_rerank": true
+    },
+    "create_time": 1772469127,
+    "update_time": 1772469127,
+    "_id": "mix:keywords:70eea45f713ba7d41cecfe12b6c4c024"
+  },
+  "mix:query:93c56c8bb2e2696afda5600872823c5f": {
+    "return": "Calypso’s fate depends on which source you look at.\n\n### In Homer’s Odyssey  \nIn the Odyssey, we are simply told that:\n\n- Calypso is a nymph who lives alone on the island of Ogygia and detains Odysseus there for seven years against his will.  \n- She promises him immortality if he will stay and be her husband, but he prefers to return home.  \n- After Athena appeals to Zeus, the gods order Calypso to release Odysseus. Hermes delivers the command.  \n- Though angry at the double standard about goddesses and mortal lovers, she obeys: she helps Odysseus build a boat, provides him with tools, timber, food (bread and wine), clothing, and other materials, and sends him off with a favorable wind.  \n- Homer does not say that she dies or otherwise specify what happens to her afterward—she remains on Ogygia once Odysseus departs. [1]\n\nSo in the original epic, “what happens to Calypso” is left open; the story follows Odysseus, not her.\n\n### Later Mythographers (Hyginus)  \nLater authors try to fill this gap. The mythographer Hyginus reports a much more tragic ending:\n\n- According to Hyginus, Calypso killed herself because of her love for Odysseus. [1]\n\nIn this later tradition, her unrequited love and the loss of Odysseus lead to her suicide, giving a definitive and sorrowful end to her story.\n\n### Later Literary Interpretations  \nLater literature sometimes imagines her as endlessly stuck in longing:\n\n- Letitia Landon’s poem *Calypso Watching the Ocean* portrays Calypso as eternally yearning for Odysseus’ return and explicitly comments on the “folly” of such obsessive desire. [1]\n\nThis doesn’t claim to be historical myth, but it shows how her fate has been reimagined as one of endless, unresolved longing rather than closure.\n\n---\n\nIn sum: Homer leaves Calypso alive on Ogygia after Odysseus sails away; a later source (Hyginus) says she kills herself for love; and later literature often treats her as a figure of permanent, obsessive yearning.\n\n### References\n\n- [1] Calypso (mythology)",
+    "cache_type": "query",
+    "chunk_id": null,
+    "original_prompt": "what happened to calpyso",
+    "queryparam": {
+      "mode": "mix",
+      "response_type": "Multiple Paragraphs",
+      "top_k": 40,
+      "chunk_top_k": 20,
+      "max_entity_tokens": 6000,
+      "max_relation_tokens": 8000,
+      "max_total_tokens": 30000,
+      "hl_keywords": "Fate of Calpyso, Status of Calpyso, What happened to Calpyso",
+      "ll_keywords": "Calpyso",
+      "user_prompt": "",
+      "enable_rerank": true
+    },
+    "create_time": 1772469145,
+    "update_time": 1772469145,
+    "_id": "mix:query:93c56c8bb2e2696afda5600872823c5f"
   }
 }

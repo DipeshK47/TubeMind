@@ -1881,7 +1881,6 @@ def api_seed_youtube(request: Request, query: str = "", order: str = "relevance"
         **s,
     }
 
-
 @rt("/api/query_youtube", methods=["POST"])
 async def api_query_youtube(request: Request, question: str = "", mode: str = DEFAULT_QUERY_MODE):
     try:

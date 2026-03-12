@@ -189,6 +189,7 @@ class TubeMindApp:
         self.lock = threading.RLock()
         self.rag = self._create_rag()
         self._bg_thread: Optional[threading.Thread] = None
+        self._repair_state_after_restart()
 
     def _create_rag(self):
         from lightrag import LightRAG
@@ -208,6 +209,26 @@ class TubeMindApp:
 
     async def shutdown(self) -> None:
         await self.rag.finalize_storages()
+
+    def _repair_state_after_restart(self) -> None:
+        changed = False
+
+        if self.state.job_active:
+            self.state.job_active = False
+            self.state.job_stage = "interrupted"
+            self.state.job_message = "Previous indexing run was interrupted. Start indexing again."
+            changed = True
+
+        if not self.state.youtube_indexed and (
+            self.state.youtube_video_ids or self.state.youtube_titles or self.state.youtube_urls
+        ):
+            self.state.youtube_video_ids = []
+            self.state.youtube_titles = []
+            self.state.youtube_urls = {}
+            changed = True
+
+        if changed:
+            self.state.save()
 
     def reset_youtube_index(self) -> None:
         with self.lock:
@@ -625,6 +646,10 @@ class TubeMindApp:
                     asyncio.run(self._run_youtube_index_job(job_id, normalized, max_videos, min_seconds, order))
                 except Exception as e:
                     with self.lock:
+                        self.state.youtube_indexed = False
+                        self.state.youtube_video_ids = []
+                        self.state.youtube_titles = []
+                        self.state.youtube_urls = {}
                         self._set_job(active=False, stage="error", progress=0, total=0, msg=str(e))
 
             self._bg_thread = threading.Thread(target=runner, daemon=True)
@@ -650,6 +675,7 @@ class TubeMindApp:
         documents: List[str] = []
         ids: List[str] = []
         file_paths: List[str] = []
+        indexed_videos: List[YouTubeVideo] = []
         consecutive_rate_limits = 0
 
         for i, v in enumerate(videos, start=1):
@@ -732,12 +758,7 @@ class TubeMindApp:
             documents.append(doc)
             ids.append(f"youtube:{v.video_id}")
             file_paths.append(v.url)
-
-            with self.lock:
-                self.state.youtube_video_ids.append(v.video_id)
-                self.state.youtube_titles.append(v.title)
-                self.state.youtube_urls[v.title] = v.url
-                self.state.save()
+            indexed_videos.append(v)
 
             time.sleep(self._transcript_request_delay())
 
@@ -745,11 +766,14 @@ class TubeMindApp:
             self._set_job(active=True, stage="index", progress=0, total=len(documents), msg="Indexing into LightRAG...")
 
         if documents:
-            self.rag.insert(documents, ids=ids, file_paths=file_paths)
+            await self.rag.ainsert(documents, ids=ids, file_paths=file_paths)
 
         with self.lock:
             indexed_count = len(documents)
             self.state.youtube_indexed = indexed_count > 0
+            self.state.youtube_video_ids = [video.video_id for video in indexed_videos]
+            self.state.youtube_titles = [video.title for video in indexed_videos]
+            self.state.youtube_urls = {video.title: video.url for video in indexed_videos}
             done_msg = f"Indexed {indexed_count} videos."
             if indexed_count == 0:
                 if any(self._looks_rate_limited(str(item.get("reason", ""))) for item in self.state.youtube_skipped):
@@ -759,19 +783,19 @@ class TubeMindApp:
             self._set_job(active=False, stage="done", progress=indexed_count, total=indexed_count, msg=done_msg)
             self.state.save()
 
-    def query_youtube(self, question: str, mode: str = DEFAULT_QUERY_MODE) -> str:
+    async def query_youtube(self, question: str, mode: str = DEFAULT_QUERY_MODE) -> str:
         q = question.strip()
         if not q:
             raise ValueError("Enter a question.")
         if not self.state.youtube_indexed:
-            raise ValueError("Index YouTube first.")
+            raise ValueError("Index YouTube first. If the previous run failed, start indexing again to finalize the corpus.")
         if mode not in QUERY_MODES:
             mode = DEFAULT_QUERY_MODE
 
         from lightrag import QueryParam
 
         answer = str(
-            self.rag.query(
+            await self.rag.aquery(
                 q,
                 param=QueryParam(mode=mode, response_type="Multiple Paragraphs"),
             )
@@ -783,13 +807,15 @@ class TubeMindApp:
 
     def status_payload(self) -> Dict[str, Any]:
         s = self.state
+        indexed_titles = s.youtube_titles if s.youtube_indexed else []
+        indexed_urls = s.youtube_urls if s.youtube_indexed else {}
         return {
             "youtube": {
                 "indexed": s.youtube_indexed,
                 "seed_query": s.youtube_seed_query,
-                "count": len(s.youtube_titles),
-                "titles": s.youtube_titles,
-                "urls": s.youtube_urls,
+                "count": len(indexed_titles),
+                "titles": indexed_titles,
+                "urls": indexed_urls,
                 "recommendations": s.youtube_recommendations,
             },
             "job": {
@@ -1614,9 +1640,9 @@ def api_seed_youtube(request: Request, query: str = "", order: str = "relevance"
 
 
 @rt("/api/query_youtube", methods=["POST"])
-def api_query_youtube(request: Request, question: str = "", mode: str = DEFAULT_QUERY_MODE):
+async def api_query_youtube(request: Request, question: str = "", mode: str = DEFAULT_QUERY_MODE):
     try:
-        ans = app_state.query_youtube(question, mode=mode)
+        ans = await app_state.query_youtube(question, mode=mode)
         if request.headers.get("hx-request", "").lower() == "true":
             return render_answer_panel(answer=ans, indexed=app_state.state.youtube_indexed)
         return {"ok": True, "answer": ans}

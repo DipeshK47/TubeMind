@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import html
 import json
 import os
@@ -71,7 +72,7 @@ def load_environment() -> None:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY was not found in backend/.env")
     if not os.environ.get("OPENAI_MODEL"):
-        os.environ["OPENAI_MODEL"] = "gpt-4o-mini"
+        os.environ["OPENAI_MODEL"] = "gpt-4.1-nano"
     if not os.environ.get("YOUTUBE_API_KEY"):
         raise RuntimeError("YOUTUBE_API_KEY was not found in backend/.env")
 
@@ -187,16 +188,63 @@ class TubeMindApp:
         APP_ROOT.mkdir(parents=True, exist_ok=True)
         self.state = CorpusState.load()
         self.lock = threading.RLock()
-        self.rag = self._create_rag()
+        self._rag_loop = asyncio.new_event_loop()
+        self._rag_loop_ready = threading.Event()
+        self._rag_thread: Optional[threading.Thread] = None
+        self.rag = None
+        self._start_rag_runtime()
+        self.rag = self._run_coro_on_rag_loop_sync(self._create_rag())
         self._bg_thread: Optional[threading.Thread] = None
         self._repair_state_after_restart()
 
-    def _create_rag(self):
+    def _start_rag_runtime(self) -> None:
+        self._rag_thread = threading.Thread(target=self._run_rag_loop, name="tubemind-rag-loop", daemon=True)
+        self._rag_thread.start()
+        if not self._rag_loop_ready.wait(timeout=5):
+            raise RuntimeError("TubeMind could not start the LightRAG worker loop.")
+
+    def _run_rag_loop(self) -> None:
+        asyncio.set_event_loop(self._rag_loop)
+        self._rag_loop_ready.set()
+        try:
+            self._rag_loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self._rag_loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._rag_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._rag_loop.run_until_complete(self._rag_loop.shutdown_asyncgens())
+            self._rag_loop.run_until_complete(self._rag_loop.shutdown_default_executor())
+            self._rag_loop.close()
+
+    def _submit_coro_to_rag_loop(self, coro) -> concurrent.futures.Future[Any]:
+        if not self._rag_thread or not self._rag_thread.is_alive():
+            raise RuntimeError("TubeMind knowledge base worker is not running.")
+        return asyncio.run_coroutine_threadsafe(coro, self._rag_loop)
+
+    async def _run_coro_on_rag_loop(self, coro):
+        try:
+            future = self._submit_coro_to_rag_loop(coro)
+        except Exception:
+            coro.close()
+            raise
+        return await asyncio.wrap_future(future)
+
+    def _run_coro_on_rag_loop_sync(self, coro):
+        try:
+            future = self._submit_coro_to_rag_loop(coro)
+        except Exception:
+            coro.close()
+            raise
+        return future.result()
+
+    async def _create_rag(self):
         from lightrag import LightRAG
         from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 
-        model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-        llm_model = partial(openai_complete_if_cache, model, reasoning_effort="none")
+        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano")
+        llm_model = partial(openai_complete_if_cache, model)
 
         return LightRAG(
             working_dir=str(RAG_STORAGE_DIR),
@@ -205,10 +253,16 @@ class TubeMindApp:
         )
 
     async def startup(self) -> None:
-        await self.rag.initialize_storages()
+        await self._run_coro_on_rag_loop(self.rag.initialize_storages())
+        await self._repair_rag_backed_state()
 
     async def shutdown(self) -> None:
-        await self.rag.finalize_storages()
+        try:
+            await self._run_coro_on_rag_loop(self.rag.finalize_storages())
+        finally:
+            if self._rag_thread and self._rag_thread.is_alive():
+                self._rag_loop.call_soon_threadsafe(self._rag_loop.stop)
+                self._rag_thread.join(timeout=5)
 
     def _repair_state_after_restart(self) -> None:
         changed = False
@@ -228,6 +282,169 @@ class TubeMindApp:
             changed = True
 
         if changed:
+            self.state.save()
+
+    def _youtube_video_id_from_doc_id(self, doc_id: str) -> str:
+        if not doc_id.startswith("youtube:"):
+            return ""
+        return doc_id.split(":", 1)[1].strip()
+
+    def _extract_title_from_summary(self, summary: str) -> str:
+        match = re.search(r"(?m)^Title:\s*(.+)$", summary or "")
+        return match.group(1).strip() if match else ""
+
+    def _merge_skipped_items(self, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for item in [*existing, *incoming]:
+            key = (
+                str(item.get("videoId") or "").strip()
+                or str(item.get("url") or "").strip()
+                or str(item.get("title") or "").strip()
+            )
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+
+        return merged[-30:]
+
+    def _classify_doc_status_docs(
+        self,
+        docs: Dict[str, Any],
+        video_lookup: Optional[Dict[str, YouTubeVideo]] = None,
+    ) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        from lightrag.base import DocStatus
+
+        successful: List[Dict[str, str]] = []
+        failed: List[Dict[str, str]] = []
+        video_lookup = video_lookup or {}
+        video_lookup_by_url = {video.url: video for video in video_lookup.values()}
+        order = {video_id: idx for idx, video_id in enumerate(video_lookup.keys())}
+
+        for doc_id, status_doc in docs.items():
+            video_id = self._youtube_video_id_from_doc_id(doc_id)
+            file_path = str(getattr(status_doc, "file_path", "") or "")
+            video = video_lookup.get(video_id)
+            if not video and file_path:
+                video = video_lookup_by_url.get(file_path)
+                if video and not video_id:
+                    video_id = video.video_id
+
+            title = (
+                video.title
+                if video
+                else self._extract_title_from_summary(str(getattr(status_doc, "content_summary", "") or ""))
+            )
+            title = title or file_path or doc_id
+            url = file_path or (video.url if video else yt_watch_url(video_id) if video_id else "")
+            thumbnail = video.thumbnail if video else ""
+
+            item = {
+                "videoId": video_id,
+                "title": title,
+                "url": url,
+                "thumbnail": thumbnail,
+            }
+
+            status = getattr(status_doc, "status", None)
+            if status == DocStatus.PROCESSED:
+                successful.append(item)
+            elif status == DocStatus.FAILED:
+                failed.append(
+                    {
+                        **item,
+                        "reason": f"Indexing failed: {str(getattr(status_doc, 'error_msg', '') or 'unknown error')}",
+                    }
+                )
+
+        if order:
+            successful.sort(key=lambda item: order.get(item.get("videoId", ""), len(order)))
+            failed.sort(key=lambda item: order.get(item.get("videoId", ""), len(order)))
+
+        return successful, failed
+
+    async def _get_docs_by_status(self, status) -> Dict[str, Any]:
+        return await self._run_coro_on_rag_loop(self.rag.doc_status.get_docs_by_status(status))
+
+    async def _get_docs_by_track_id(self, track_id: str) -> Dict[str, Any]:
+        return await self._run_coro_on_rag_loop(self.rag.doc_status.get_docs_by_track_id(track_id))
+
+    async def _repair_rag_backed_state(self) -> None:
+        from lightrag.base import DocStatus
+
+        processed_docs = await self._get_docs_by_status(DocStatus.PROCESSED)
+        failed_docs = await self._get_docs_by_status(DocStatus.FAILED)
+        processing_docs = await self._get_docs_by_status(DocStatus.PROCESSING)
+        pending_docs = await self._get_docs_by_status(DocStatus.PENDING)
+
+        should_resume_queue = bool(processing_docs or pending_docs)
+        should_retry_failed_docs = (
+            bool(failed_docs)
+            and any(
+                "reasoning_effort" in str(getattr(doc, "error_msg", "") or "").lower()
+                for doc in failed_docs.values()
+            )
+        )
+
+        if should_resume_queue or should_retry_failed_docs:
+            with self.lock:
+                self._set_job(
+                    active=True,
+                    stage="index",
+                    progress=0,
+                    total=len(processing_docs) + len(pending_docs) + len(failed_docs),
+                    msg="Repairing stored transcripts into a usable corpus...",
+                )
+            await self._run_coro_on_rag_loop(self.rag.apipeline_process_enqueue_documents())
+            processed_docs = await self._get_docs_by_status(DocStatus.PROCESSED)
+            failed_docs = await self._get_docs_by_status(DocStatus.FAILED)
+
+        successful, failed = self._classify_doc_status_docs({**processed_docs, **failed_docs})
+        rag_video_ids = {item["videoId"] for item in [*successful, *failed] if item.get("videoId")}
+
+        with self.lock:
+            prior_state_video_ids = set(self.state.youtube_video_ids)
+            self.state.youtube_indexed = bool(successful)
+            self.state.youtube_video_ids = [item["videoId"] for item in successful if item.get("videoId")]
+            self.state.youtube_titles = [item["title"] for item in successful]
+            self.state.youtube_urls = {
+                item["title"]: item["url"]
+                for item in successful
+                if item.get("title") and item.get("url")
+            }
+
+            if prior_state_video_ids and not prior_state_video_ids.issubset(rag_video_ids):
+                self.state.youtube_recommendations = []
+
+            non_index_failures = [
+                item
+                for item in self.state.youtube_skipped
+                if not str(item.get("reason", "")).startswith("Indexing failed:")
+            ]
+            self.state.youtube_skipped = self._merge_skipped_items(non_index_failures, failed)
+
+            self.state.job_active = False
+            self.state.job_progress = len(successful)
+            self.state.job_total = len(successful)
+
+            if successful:
+                self.state.job_stage = "done"
+                if should_resume_queue or should_retry_failed_docs:
+                    self.state.job_message = f"Recovered {len(successful)} indexed video(s) from stored transcripts."
+                else:
+                    self.state.job_message = f"Indexed {len(successful)} videos."
+            elif failed:
+                self.state.job_stage = "error"
+                if should_resume_queue or should_retry_failed_docs:
+                    self.state.job_message = "Stored transcripts were found, but rebuilding the corpus still failed. Check skipped videos for the latest error."
+                else:
+                    self.state.job_message = "Stored transcripts exist, but the corpus is not ready yet. Start indexing again to rebuild it."
+
+            if self.state.job_id == "job_test":
+                self.state.job_id = ""
+
             self.state.save()
 
     def reset_youtube_index(self) -> None:
@@ -765,22 +982,46 @@ class TubeMindApp:
         with self.lock:
             self._set_job(active=True, stage="index", progress=0, total=len(documents), msg="Indexing into LightRAG...")
 
+        successful_videos: List[Dict[str, str]] = [
+            {
+                "videoId": video.video_id,
+                "title": video.title,
+                "url": video.url,
+                "thumbnail": video.thumbnail,
+            }
+            for video in indexed_videos
+        ]
+        processing_failures: List[Dict[str, str]] = []
+
         if documents:
-            await self.rag.ainsert(documents, ids=ids, file_paths=file_paths)
+            track_id = await self._run_coro_on_rag_loop(self.rag.ainsert(documents, ids=ids, file_paths=file_paths))
+            track_docs = await self._get_docs_by_track_id(track_id)
+            successful_videos, processing_failures = self._classify_doc_status_docs(
+                track_docs,
+                {video.video_id: video for video in indexed_videos},
+            )
 
         with self.lock:
-            indexed_count = len(documents)
+            self.state.youtube_skipped = self._merge_skipped_items(self.state.youtube_skipped, processing_failures)
+            indexed_count = len(successful_videos)
             self.state.youtube_indexed = indexed_count > 0
-            self.state.youtube_video_ids = [video.video_id for video in indexed_videos]
-            self.state.youtube_titles = [video.title for video in indexed_videos]
-            self.state.youtube_urls = {video.title: video.url for video in indexed_videos}
+            self.state.youtube_video_ids = [video["videoId"] for video in successful_videos if video.get("videoId")]
+            self.state.youtube_titles = [video["title"] for video in successful_videos]
+            self.state.youtube_urls = {
+                video["title"]: video["url"]
+                for video in successful_videos
+                if video.get("title") and video.get("url")
+            }
             done_msg = f"Indexed {indexed_count} videos."
             if indexed_count == 0:
-                if any(self._looks_rate_limited(str(item.get("reason", ""))) for item in self.state.youtube_skipped):
+                if processing_failures:
+                    done_msg = "Transcripts were fetched, but building the corpus failed. Check skipped videos for the exact OpenAI or indexing error."
+                elif any(self._looks_rate_limited(str(item.get("reason", ""))) for item in self.state.youtube_skipped):
                     done_msg += " YouTube rate-limited transcript access for this IP. Try fewer videos or configure cookies in .env."
                 else:
                     done_msg += " (Most likely transcripts were disabled. Check skipped list.)"
-            self._set_job(active=False, stage="done", progress=indexed_count, total=indexed_count, msg=done_msg)
+            final_stage = "done" if indexed_count > 0 else "error"
+            self._set_job(active=False, stage=final_stage, progress=indexed_count, total=indexed_count, msg=done_msg)
             self.state.save()
 
     async def query_youtube(self, question: str, mode: str = DEFAULT_QUERY_MODE) -> str:
@@ -795,9 +1036,11 @@ class TubeMindApp:
         from lightrag import QueryParam
 
         answer = str(
-            await self.rag.aquery(
-                q,
-                param=QueryParam(mode=mode, response_type="Multiple Paragraphs"),
+            await self._run_coro_on_rag_loop(
+                self.rag.aquery(
+                    q,
+                    param=QueryParam(mode=mode, response_type="Multiple Paragraphs"),
+                )
             )
         ).strip()
 

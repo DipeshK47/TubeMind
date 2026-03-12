@@ -6,6 +6,7 @@ import html
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -23,9 +24,7 @@ from youtube_transcript_api import NoTranscriptFound, TooManyRequests, YouTubeRe
 from fasthtml.common import *
 
 ROOT = Path(__file__).resolve().parent
-APP_ROOT = ROOT / ".local" / "tubemind_app"
-RAG_STORAGE_DIR = APP_ROOT / "rag_storage"
-STATE_FILE = APP_ROOT / "state.json"
+APP_ROOT = ROOT / ".local"
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
@@ -141,12 +140,17 @@ class CorpusState:
     job_total: int = 0
     job_message: str = ""
 
+    # per-user path — not serialized
+    _state_file: Path = field(default=None, repr=False, compare=False)
+
     @classmethod
-    def load(cls) -> "CorpusState":
-        if not STATE_FILE.exists():
-            return cls()
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        return cls(
+    def load(cls, state_file: Path) -> "CorpusState":
+        if not state_file.exists():
+            obj = cls()
+            obj._state_file = state_file
+            return obj
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+        obj = cls(
             youtube_indexed=bool(data.get("youtube_indexed", False)),
             youtube_seed_query=str(data.get("youtube_seed_query", "")),
             youtube_video_ids=[str(x) for x in data.get("youtube_video_ids", [])],
@@ -161,9 +165,11 @@ class CorpusState:
             job_total=int(data.get("job_total", 0)),
             job_message=str(data.get("job_message", "")),
         )
+        obj._state_file = state_file
+        return obj
 
     def save(self) -> None:
-        APP_ROOT.mkdir(parents=True, exist_ok=True)
+        self._state_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "youtube_indexed": self.youtube_indexed,
             "youtube_seed_query": self.youtube_seed_query,
@@ -179,14 +185,17 @@ class CorpusState:
             "job_total": self.job_total,
             "job_message": self.job_message,
         }
-        STATE_FILE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 class TubeMindApp:
-    def __init__(self) -> None:
-        load_environment()
-        APP_ROOT.mkdir(parents=True, exist_ok=True)
-        self.state = CorpusState.load()
+    def __init__(self, user_id: str) -> None:
+        self.user_id = user_id
+        self._user_root = APP_ROOT / "users" / user_id / "tubemind_app"
+        self._rag_storage_dir = self._user_root / "rag_storage"
+        self._state_file = self._user_root / "state.json"
+        self._user_root.mkdir(parents=True, exist_ok=True)
+        self.state = CorpusState.load(self._state_file)
         self.lock = threading.RLock()
         self._rag_loop = asyncio.new_event_loop()
         self._rag_loop_ready = threading.Event()
@@ -247,7 +256,7 @@ class TubeMindApp:
         llm_model = partial(openai_complete_if_cache, model)
 
         return LightRAG(
-            working_dir=str(RAG_STORAGE_DIR),
+            working_dir=str(self._rag_storage_dir),
             llm_model_func=llm_model,
             embedding_func=openai_embed,
         )
@@ -1073,11 +1082,93 @@ class TubeMindApp:
         }
 
 
-app_state = TubeMindApp()
+# ── environment (load once at module level) ───────────────────────────────────
+load_environment()
+
+# ── Google OAuth config ───────────────────────────────────────────────────────
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_hex(32)
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:5001")
+REDIRECT_URI = f"{BASE_URL}/auth/callback"
+
+# ── database ──────────────────────────────────────────────────────────────────
+APP_ROOT.mkdir(parents=True, exist_ok=True)
+db = database(str(APP_ROOT / "tubemind.db"))
+users_table = db.t.users
+if users_table not in db.t:
+    users_table.create(dict(id=str, email=str, name=str, picture=str), pk="id")
+
+# ── per-user app registry ─────────────────────────────────────────────────────
+_user_apps: Dict[str, TubeMindApp] = {}
+_user_locks: Dict[str, asyncio.Lock] = {}
+
+
+async def get_user_app(user_id: str) -> TubeMindApp:
+    if user_id in _user_apps:
+        return _user_apps[user_id]
+    if user_id not in _user_locks:
+        _user_locks[user_id] = asyncio.Lock()
+    async with _user_locks[user_id]:
+        if user_id not in _user_apps:
+            instance = TubeMindApp(user_id)
+            await instance.startup()
+            _user_apps[user_id] = instance
+    return _user_apps[user_id]
+
+
+async def _shutdown_all_user_apps() -> None:
+    for instance in list(_user_apps.values()):
+        try:
+            await instance.shutdown()
+        except Exception:
+            pass
+
+
+# ── Google OAuth helpers ──────────────────────────────────────────────────────
+
+def google_auth_url(state: str) -> str:
+    params = urlencode({
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "access_type": "online",
+    })
+    return f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
+
+
+def google_exchange_code(code: str) -> dict:
+    data = urlencode({
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }).encode()
+    req = UrlRequest(
+        "https://oauth2.googleapis.com/token",
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
+
+def google_userinfo(access_token: str) -> dict:
+    req = UrlRequest(
+        "https://www.googleapis.com/oauth2/v2/userinfo",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    with urlopen(req) as resp:
+        return json.loads(resp.read())
+
 
 app, rt = fast_app(
     title="TubeMind",
     pico=True,
+    secret_key=SESSION_SECRET,
     hdrs=(
         Link(
             rel="icon",
@@ -1415,9 +1506,91 @@ app, rt = fast_app(
             """
         ),
     ),
-    on_startup=[app_state.startup],
-    on_shutdown=[app_state.shutdown],
+    on_shutdown=[_shutdown_all_user_apps],
 )
+
+
+# ── session helper ────────────────────────────────────────────────────────────
+
+def current_user(session) -> Any:
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    try:
+        return users_table[user_id]
+    except Exception:
+        return None
+
+
+# ── auth routes ───────────────────────────────────────────────────────────────
+
+_ERROR_MESSAGES = {
+    "no_code": "Google did not return an authorization code.",
+    "bad_state": "Security check failed. Please try again.",
+    "oauth_failed": "Could not complete sign-in with Google. Please try again.",
+}
+
+
+@rt("/login")
+def get_login(session, error: str = ""):
+    user = current_user(session)
+    if user:
+        return RedirectResponse("/", status_code=303)
+    state = secrets.token_urlsafe(16)
+    session["oauth_state"] = state
+    error_msg = _ERROR_MESSAGES.get(error, "")
+    return Title("TubeMind – Sign in"), Div(
+        Div(
+            H2("Welcome to TubeMind", style="margin-bottom:0.5rem"),
+            P("Sign in with Google to get your own private YouTube research workspace.", style="color:var(--muted-ink);margin-bottom:1.5rem"),
+            (
+                Div(
+                    error_msg,
+                    style="color:#b91c1c;background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:0.6rem 1rem;margin-bottom:1rem;font-size:0.9rem",
+                )
+                if error_msg else ""
+            ),
+            A(
+                "Sign in with Google",
+                href=google_auth_url(state),
+                role="button",
+                style="display:block;text-align:center;background:var(--accent);color:#fff;border-radius:12px;padding:0.75rem 1.5rem;text-decoration:none;font-weight:600",
+            ),
+            style="max-width:380px;margin:120px auto;background:var(--surface);border-radius:var(--radius-lg);padding:2.5rem;box-shadow:var(--shadow)",
+        ),
+    )
+
+
+@rt("/auth/callback")
+def get_auth_callback(request: Request, session, code: str = "", state: str = ""):
+    if not code:
+        return RedirectResponse("/login?error=no_code", status_code=303)
+    if state != session.get("oauth_state"):
+        return RedirectResponse("/login?error=bad_state", status_code=303)
+    session.pop("oauth_state", None)
+    try:
+        token_data = google_exchange_code(code)
+        info = google_userinfo(token_data["access_token"])
+    except Exception:
+        return RedirectResponse("/login?error=oauth_failed", status_code=303)
+    user_id = str(info["id"])
+    try:
+        users_table[user_id]
+    except Exception:
+        users_table.insert(dict(
+            id=user_id,
+            email=info.get("email", ""),
+            name=info.get("name", ""),
+            picture=info.get("picture", ""),
+        ))
+    session["user_id"] = user_id
+    return RedirectResponse("/", status_code=303)
+
+
+@rt("/logout")
+def get_logout(session):
+    session.clear()
+    return RedirectResponse("/login", status_code=303)
 
 
 def truncate_text(text: str, limit: int = 180) -> str:
@@ -1661,9 +1834,24 @@ def render_answer_panel(*, answer: str = "", error: str = "", indexed: bool = Fa
     )
 
 
-def home_page(msg: str = "", answer: str = "") -> Any:
+def user_badge(user: Any) -> Any:
+    avatar = (
+        Img(src=user["picture"], style="width:32px;height:32px;border-radius:50%;", alt=user["name"])
+        if user["picture"]
+        else Span(user["name"][:1].upper(), style="width:32px;height:32px;border-radius:50%;background:var(--accent);color:#fff;display:inline-flex;align-items:center;justify-content:center;font-weight:700")
+    )
+    return Div(
+        avatar,
+        Span(user["name"] or user["email"], style="font-size:0.9rem;color:var(--muted-ink)"),
+        A("Logout", href="/logout", style="font-size:0.85rem;color:var(--accent);text-decoration:none;margin-left:0.5rem"),
+        style="display:flex;align-items:center;gap:0.5rem;",
+    )
+
+
+def home_page(app_state: TubeMindApp, user: Any, msg: str = "", answer: str = "") -> Any:
     s = app_state.status_payload()
     return Div(
+        Div(user_badge(user), style="display:flex;justify-content:flex-end;padding:1rem 1.5rem 0"),
         Div(
             Div(
                 Span("YouTube Corpus Q&A", cls="eyebrow"),
@@ -1813,22 +2001,38 @@ def home_page(msg: str = "", answer: str = "") -> Any:
 
 
 @rt("/")
-def get_root(request: Request):
-    return home_page()
+async def get_root(request: Request, session):
+    user = current_user(session)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    app_state = await get_user_app(user["id"])
+    return home_page(app_state, user)
 
 
 @rt("/api/status")
-def api_status(request: Request):
+async def api_status(request: Request, session):
+    user = current_user(session)
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    app_state = await get_user_app(user["id"])
     return app_state.status_payload()
 
 
 @rt("/api/dashboard")
-def api_dashboard(request: Request):
+async def api_dashboard(request: Request, session):
+    user = current_user(session)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    app_state = await get_user_app(user["id"])
     return render_dashboard(app_state.status_payload())
 
 
 @rt("/api/search_youtube")
-async def api_search_youtube(request: Request, q: str = "", order: str = "relevance", minSeconds: str = "240", maxResults: str = "12"):
+async def api_search_youtube(request: Request, session, q: str = "", order: str = "relevance", minSeconds: str = "240", maxResults: str = "12"):
+    user = current_user(session)
+    if not user:
+        return {"error": "not authenticated", "query": q, "results": []}
+    app_state = await get_user_app(user["id"])
     try:
         ms = int(minSeconds) if str(minSeconds).isdigit() else 240
         mr = int(maxResults) if str(maxResults).isdigit() else 12
@@ -1857,7 +2061,11 @@ async def api_search_youtube(request: Request, q: str = "", order: str = "releva
 
 
 @rt("/api/seed_youtube", methods=["POST"])
-def api_seed_youtube(request: Request, query: str = "", order: str = "relevance", max_videos: str = "8", min_seconds: str = "240"):
+async def api_seed_youtube(request: Request, session, query: str = "", order: str = "relevance", max_videos: str = "8", min_seconds: str = "240"):
+    user = current_user(session)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    app_state = await get_user_app(user["id"])
     mv = int(max_videos) if str(max_videos).isdigit() else MAX_VIDEOS_DEFAULT
     ms = int(min_seconds) if str(min_seconds).isdigit() else MIN_SECONDS_DEFAULT
     mv = max(1, min(15, mv))
@@ -1883,7 +2091,11 @@ def api_seed_youtube(request: Request, query: str = "", order: str = "relevance"
 
 
 @rt("/api/query_youtube", methods=["POST"])
-async def api_query_youtube(request: Request, question: str = "", mode: str = DEFAULT_QUERY_MODE):
+async def api_query_youtube(request: Request, session, question: str = "", mode: str = DEFAULT_QUERY_MODE):
+    user = current_user(session)
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    app_state = await get_user_app(user["id"])
     try:
         ans = await app_state.query_youtube(question, mode=mode)
         if request.headers.get("hx-request", "").lower() == "true":

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -26,6 +28,7 @@ STATE_FILE = APP_ROOT / "state.json"
 
 YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 YOUTUBE_VIDEOS_URL = "https://www.googleapis.com/youtube/v3/videos"
+TRANSCRIPTAPI_BASE_URL = "https://transcriptapi.com/api/v2"
 
 DEFAULT_QUERY_MODE = "mix"
 QUERY_MODES = ("mix", "hybrid", "local", "global", "naive")
@@ -41,6 +44,11 @@ SEARCH_ORDER_LABELS = {
     "viewCount": "Most Viewed",
     "date": "Newest First",
 }
+COOKIE_BROWSER_LABELS = {
+    "chrome": "Google Chrome",
+    "brave": "Brave",
+    "safari": "Safari",
+}
 PROMPT_SUGGESTIONS = (
     "Give me the main ideas across these videos.",
     "What are the most practical takeaways for a beginner?",
@@ -51,8 +59,11 @@ PROMPT_SUGGESTIONS = (
 MIN_SECONDS_DEFAULT = 240
 MAX_VIDEOS_DEFAULT = 8
 JOB_POLL_SECONDS = 1.0
+MAX_RECOMMENDATIONS = 5
 TRANSCRIPT_RETRY_ATTEMPTS = 3
 TRANSCRIPT_RETRY_BASE_DELAY = 1.0
+TRANSCRIPT_REQUEST_DELAY_SECONDS = 1.5
+TRANSCRIPT_CANDIDATE_PADDING = 2
 
 
 def load_environment() -> None:
@@ -116,6 +127,7 @@ class CorpusState:
     youtube_video_ids: List[str] = field(default_factory=list)
     youtube_titles: List[str] = field(default_factory=list)
     youtube_urls: Dict[str, str] = field(default_factory=dict)
+    youtube_recommendations: List[Dict[str, Any]] = field(default_factory=list)
 
     # debug info
     youtube_skipped: List[Dict[str, Any]] = field(default_factory=list)
@@ -139,6 +151,7 @@ class CorpusState:
             youtube_video_ids=[str(x) for x in data.get("youtube_video_ids", [])],
             youtube_titles=[str(x) for x in data.get("youtube_titles", [])],
             youtube_urls={str(k): str(v) for k, v in (data.get("youtube_urls", {}) or {}).items()},
+            youtube_recommendations=list(data.get("youtube_recommendations", []) or []),
             youtube_skipped=list(data.get("youtube_skipped", []) or []),
             job_active=bool(data.get("job_active", False)),
             job_id=str(data.get("job_id", "")),
@@ -156,6 +169,7 @@ class CorpusState:
             "youtube_video_ids": self.youtube_video_ids,
             "youtube_titles": self.youtube_titles,
             "youtube_urls": self.youtube_urls,
+            "youtube_recommendations": self.youtube_recommendations,
             "youtube_skipped": self.youtube_skipped,
             "job_active": self.job_active,
             "job_id": self.job_id,
@@ -202,6 +216,7 @@ class TubeMindApp:
             self.state.youtube_video_ids = []
             self.state.youtube_titles = []
             self.state.youtube_urls = {}
+            self.state.youtube_recommendations = []
             self.state.youtube_skipped = []
             self.state.job_active = False
             self.state.job_id = ""
@@ -288,11 +303,49 @@ class TubeMindApp:
 
         return vids[:max_videos]
 
+    def _transcript_candidate_pool(self, max_videos: int) -> int:
+        raw_pad = str(os.environ.get("YOUTUBE_TRANSCRIPT_CANDIDATE_PADDING", TRANSCRIPT_CANDIDATE_PADDING))
+        try:
+            pad = int(raw_pad)
+        except ValueError:
+            pad = TRANSCRIPT_CANDIDATE_PADDING
+        pad = max(0, min(8, pad))
+        return min(25, max_videos + pad)
+
+    def _transcript_request_delay(self) -> float:
+        raw = str(os.environ.get("YOUTUBE_TRANSCRIPT_REQUEST_DELAY_SECONDS", TRANSCRIPT_REQUEST_DELAY_SECONDS))
+        try:
+            delay = float(raw)
+        except ValueError:
+            delay = TRANSCRIPT_REQUEST_DELAY_SECONDS
+        return max(0.0, min(10.0, delay))
+
+    def _serialize_recommendation(self, video: YouTubeVideo) -> Dict[str, Any]:
+        return {
+            "videoId": video.video_id,
+            "title": video.title,
+            "channelTitle": video.channel_title,
+            "durationSec": video.duration_sec,
+            "durationLabel": seconds_to_label(video.duration_sec),
+            "thumbnail": video.thumbnail,
+            "url": video.url,
+        }
+
+    def _save_recommendations(self, videos: List[YouTubeVideo]) -> None:
+        self.state.youtube_recommendations = [
+            self._serialize_recommendation(video)
+            for video in videos[:MAX_RECOMMENDATIONS]
+        ]
+        self.state.save()
+
     def _transcript_request_kwargs(self) -> Dict[str, Any]:
         cookies_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
         if not cookies_file:
             return {}
         return {"cookies": cookies_file}
+
+    def _transcript_api_key(self) -> str:
+        return str(os.environ.get("TRANSCRIPTAPI_API_KEY", "")).strip()
 
     def _is_transcript_rate_limited(self, exc: Exception) -> bool:
         if isinstance(exc, TooManyRequests):
@@ -317,7 +370,195 @@ class TubeMindApp:
             )
         return msg
 
-    def _fetch_transcript(self, video_id: str) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    def _looks_rate_limited(self, reason: str) -> bool:
+        lower = (reason or "").lower()
+        return "429" in lower or "too many requests" in lower or "rate-limit" in lower
+
+    def _yt_dlp_cookie_sources(self) -> List[tuple[str, Dict[str, Any]]]:
+        sources: List[tuple[str, Dict[str, Any]]] = [("yt-dlp", {})]
+
+        cookie_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
+        if cookie_file:
+            sources.append(("yt-dlp + cookie file", {"cookiefile": cookie_file}))
+
+        browsers_raw = str(os.environ.get("YOUTUBE_COOKIES_BROWSER", "")).strip()
+        for browser in [b.strip().lower() for b in browsers_raw.split(",") if b.strip()]:
+            sources.append(
+                (
+                    f"yt-dlp + {COOKIE_BROWSER_LABELS.get(browser, browser.title())} cookies",
+                    {"cookiesfrombrowser": (browser, None, None, None)},
+                )
+            )
+
+        return sources
+
+    def _extract_transcriptapi_error(self, payload: Any) -> str:
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        if isinstance(detail, dict):
+            return str(detail.get("message") or detail.get("reason") or json.dumps(detail))
+        if detail:
+            return str(detail)
+        if isinstance(payload, dict) and payload.get("code"):
+            return str(payload["code"])
+        return "unknown TranscriptAPI error"
+
+    def _fetch_transcript_with_transcriptapi(self, video: YouTubeVideo) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        api_key = self._transcript_api_key()
+        if not api_key:
+            return None, None
+
+        params = {
+            "video_url": video.url,
+            "format": "json",
+            "include_timestamp": "true",
+            "send_metadata": "false",
+        }
+        headers = {"Authorization": f"Bearer {api_key}"}
+        retry_delay = 1.0
+        last_err = "unknown TranscriptAPI error"
+
+        with httpx.Client(timeout=45) as client:
+            for _attempt in range(3):
+                resp = client.get(f"{TRANSCRIPTAPI_BASE_URL}/youtube/transcript", params=params, headers=headers)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    transcript = payload.get("transcript") or []
+                    segs = [
+                        {
+                            "start": float(item.get("start", 0.0) or 0.0),
+                            "text": str(item.get("text", "")).strip(),
+                        }
+                        for item in transcript
+                        if str(item.get("text", "")).strip()
+                    ]
+                    if segs:
+                        return segs, None
+                    last_err = "TranscriptAPI returned an empty transcript"
+                    break
+
+                try:
+                    payload = resp.json()
+                except Exception:
+                    payload = {"detail": resp.text}
+                last_err = self._extract_transcriptapi_error(payload)
+
+                if resp.status_code in (408, 429, 503):
+                    retry_after = resp.headers.get("Retry-After")
+                    try:
+                        retry_delay = float(retry_after) if retry_after else retry_delay
+                    except ValueError:
+                        retry_delay = retry_delay
+                    time.sleep(max(1.0, retry_delay))
+                    retry_delay = min(retry_delay * 2, 10.0)
+                    continue
+                break
+
+        return None, f"TranscriptAPI: {last_err}"
+
+    def _parse_seconds_label(self, value: str) -> float:
+        clean = value.strip().replace(",", ".")
+        parts = clean.split(":")
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600 + int(m) * 60 + float(s)
+        if len(parts) == 2:
+            m, s = parts
+            return int(m) * 60 + float(s)
+        return float(clean)
+
+    def _parse_vtt_segments(self, text: str) -> List[Dict[str, Any]]:
+        lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        segs: List[Dict[str, Any]] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if "-->" not in line:
+                i += 1
+                continue
+
+            start_raw = line.split("-->", 1)[0].strip().split(" ")[0]
+            i += 1
+            cue_lines: List[str] = []
+            while i < len(lines) and lines[i].strip():
+                cue_lines.append(lines[i].strip())
+                i += 1
+
+            cue_text = re.sub(r"<[^>]+>", "", " ".join(cue_lines)).strip()
+            cue_text = html.unescape(cue_text)
+            if cue_text:
+                segs.append({"start": self._parse_seconds_label(start_raw), "text": cue_text})
+        return segs
+
+    def _parse_json3_segments(self, text: str) -> List[Dict[str, Any]]:
+        payload = json.loads(text)
+        segs: List[Dict[str, Any]] = []
+        for event in payload.get("events", []) or []:
+            parts = event.get("segs") or []
+            if not parts:
+                continue
+            cue_text = html.unescape("".join(str(part.get("utf8", "")) for part in parts)).replace("\n", " ").strip()
+            if not cue_text:
+                continue
+            segs.append({"start": float(event.get("tStartMs", 0) or 0) / 1000.0, "text": cue_text})
+        return segs
+
+    def _read_subtitle_segments(self, path: Path) -> List[Dict[str, Any]]:
+        text = path.read_text(encoding="utf-8")
+        suffix = path.suffix.lower()
+        if suffix == ".json3":
+            return self._parse_json3_segments(text)
+        if suffix == ".vtt":
+            return self._parse_vtt_segments(text)
+        raise RuntimeError(f"Unsupported subtitle format: {path.name}")
+
+    def _fetch_transcript_with_ytdlp(self, video: YouTubeVideo) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+        try:
+            from yt_dlp import DownloadError, YoutubeDL
+        except Exception as exc:
+            return None, f"yt-dlp fallback unavailable: {type(exc).__name__}: {exc}"
+
+        last_err: Optional[str] = None
+        for source_label, extra_opts in self._yt_dlp_cookie_sources():
+            try:
+                with tempfile.TemporaryDirectory(prefix="tubemind_subs_") as tmpdir:
+                    outtmpl = str(Path(tmpdir) / "%(id)s.%(ext)s")
+                    opts = {
+                        "skip_download": True,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "writesubtitles": True,
+                        "writeautomaticsub": True,
+                        "subtitleslangs": ["en", "en.*"],
+                        "subtitlesformat": "json3/vtt/best",
+                        "outtmpl": {"default": outtmpl, "subtitle": outtmpl},
+                    } | extra_opts
+
+                    with YoutubeDL(opts) as ydl:
+                        ydl.download([video.url])
+
+                    subtitle_files = sorted(Path(tmpdir).glob(f"{video.video_id}*.json3"))
+                    subtitle_files.extend(sorted(Path(tmpdir).glob(f"{video.video_id}*.vtt")))
+                    if not subtitle_files:
+                        last_err = f"{source_label} did not produce a subtitle file"
+                        continue
+
+                    segs = self._read_subtitle_segments(subtitle_files[0])
+                    if segs:
+                        return segs, None
+                    last_err = f"{source_label} produced an empty subtitle file"
+            except Exception as exc:
+                label = source_label
+                if extra_opts.get("cookiesfrombrowser"):
+                    browser = extra_opts["cookiesfrombrowser"][0]
+                    label = f"{source_label} ({COOKIE_BROWSER_LABELS.get(browser, browser.title())})"
+                if isinstance(exc, DownloadError):
+                    last_err = f"{label}: {exc}"
+                else:
+                    last_err = f"{label}: {type(exc).__name__}: {exc}"
+
+        return None, last_err
+
+    def _fetch_transcript(self, video: YouTubeVideo) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
         # Return (segments, error_string) with retries for flaky YouTube responses.
         last_err: Optional[str] = None
         request_kwargs = self._transcript_request_kwargs()
@@ -325,9 +566,9 @@ class TubeMindApp:
         for attempt in range(1, TRANSCRIPT_RETRY_ATTEMPTS + 1):
             try:
                 try:
-                    segs = YouTubeTranscriptApi.get_transcript(video_id, languages=("en",), **request_kwargs)
+                    segs = YouTubeTranscriptApi.get_transcript(video.video_id, languages=("en",), **request_kwargs)
                 except NoTranscriptFound:
-                    segs = YouTubeTranscriptApi.get_transcript(video_id, **request_kwargs)
+                    segs = YouTubeTranscriptApi.get_transcript(video.video_id, **request_kwargs)
 
                 if not segs:
                     last_err = "empty transcript payload"
@@ -340,6 +581,18 @@ class TubeMindApp:
 
             if attempt < TRANSCRIPT_RETRY_ATTEMPTS:
                 time.sleep(TRANSCRIPT_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+
+        transcript_api_segs, transcript_api_err = self._fetch_transcript_with_transcriptapi(video)
+        if transcript_api_segs:
+            return transcript_api_segs, None
+
+        yt_dlp_segs, yt_dlp_err = self._fetch_transcript_with_ytdlp(video)
+        if yt_dlp_segs:
+            return yt_dlp_segs, None
+
+        fallback_errors = [err for err in (transcript_api_err, yt_dlp_err) if err]
+        if fallback_errors:
+            last_err = "\n".join([last_err or "transcript fetch failed", *fallback_errors])
 
         return None, last_err or "unknown transcript error"
 
@@ -379,12 +632,13 @@ class TubeMindApp:
             return job_id
 
     async def _run_youtube_index_job(self, job_id: str, query: str, max_videos: int, min_seconds: int, order: str) -> None:
-        candidate_pool = max(max_videos * 3, max_videos + 6)
+        candidate_pool = self._transcript_candidate_pool(max_videos)
         videos = await self.youtube_search(query, max_videos=candidate_pool, min_seconds=min_seconds, order=order)
 
         with self.lock:
             if self.state.job_id != job_id:
                 return
+            self._save_recommendations(videos)
             self._set_job(
                 active=True,
                 stage="transcripts",
@@ -396,6 +650,7 @@ class TubeMindApp:
         documents: List[str] = []
         ids: List[str] = []
         file_paths: List[str] = []
+        consecutive_rate_limits = 0
 
         for i, v in enumerate(videos, start=1):
             if len(documents) >= max_videos:
@@ -412,20 +667,37 @@ class TubeMindApp:
                     msg=f"Transcript {i} of {len(videos)}",
                 )
 
-            segs, err = self._fetch_transcript(v.video_id)
+            segs, err = self._fetch_transcript(v)
             if not segs:
+                if err and self._looks_rate_limited(err):
+                    consecutive_rate_limits += 1
+                else:
+                    consecutive_rate_limits = 0
                 with self.lock:
                     self.state.youtube_skipped.append(
                         {
                             "videoId": v.video_id,
                             "title": v.title,
+                            "thumbnail": v.thumbnail,
                             "url": v.url,
                             "reason": err or "unknown",
                         }
                     )
                     self.state.save()
+                if consecutive_rate_limits >= 2 and not documents:
+                    with self.lock:
+                        self._set_job(
+                            active=False,
+                            stage="done",
+                            progress=i,
+                            total=len(videos),
+                            msg="YouTube rate-limited transcript access. Recommendations are still available on the right.",
+                        )
+                    break
+                time.sleep(self._transcript_request_delay())
                 continue
 
+            consecutive_rate_limits = 0
             transcript = self._format_transcript(segs)
             if not transcript.strip():
                 with self.lock:
@@ -433,6 +705,7 @@ class TubeMindApp:
                         {
                             "videoId": v.video_id,
                             "title": v.title,
+                            "thumbnail": v.thumbnail,
                             "url": v.url,
                             "reason": "empty transcript",
                         }
@@ -466,6 +739,8 @@ class TubeMindApp:
                 self.state.youtube_urls[v.title] = v.url
                 self.state.save()
 
+            time.sleep(self._transcript_request_delay())
+
         with self.lock:
             self._set_job(active=True, stage="index", progress=0, total=len(documents), msg="Indexing into LightRAG...")
 
@@ -477,7 +752,10 @@ class TubeMindApp:
             self.state.youtube_indexed = indexed_count > 0
             done_msg = f"Indexed {indexed_count} videos."
             if indexed_count == 0:
-                done_msg += " (Most likely transcripts were disabled. Check skipped list.)"
+                if any(self._looks_rate_limited(str(item.get("reason", ""))) for item in self.state.youtube_skipped):
+                    done_msg += " YouTube rate-limited transcript access for this IP. Try fewer videos or configure cookies in .env."
+                else:
+                    done_msg += " (Most likely transcripts were disabled. Check skipped list.)"
             self._set_job(active=False, stage="done", progress=indexed_count, total=indexed_count, msg=done_msg)
             self.state.save()
 
@@ -512,6 +790,7 @@ class TubeMindApp:
                 "count": len(s.youtube_titles),
                 "titles": s.youtube_titles,
                 "urls": s.youtube_urls,
+                "recommendations": s.youtube_recommendations,
             },
             "job": {
                 "active": s.job_active,
@@ -531,6 +810,10 @@ app, rt = fast_app(
     title="TubeMind",
     pico=True,
     hdrs=(
+        Link(
+            rel="icon",
+            href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%230f766e'/%3E%3Cpath d='M15 19h34L37 33v12H27V33z' fill='%23fff8ee'/%3E%3C/svg%3E",
+        ),
         Link(rel="preconnect", href="https://fonts.googleapis.com"),
         Link(rel="preconnect", href="https://fonts.gstatic.com", crossorigin=""),
         Link(
@@ -584,12 +867,14 @@ app, rt = fast_app(
                 box-shadow: var(--shadow);
                 padding: 28px;
             }
-            .hero-grid, .workflow-grid, .dashboard-grid, .metrics-grid, .field-grid {
+            .hero-grid, .workflow-grid, .dashboard-grid, .dashboard-body, .dashboard-main, .metrics-grid, .field-grid {
                 display: grid;
                 gap: 18px;
             }
             .hero-grid { grid-template-columns: minmax(0, 1.3fr) minmax(280px, 0.7fr); align-items: end; }
             .workflow-grid, .dashboard-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 18px; }
+            .dashboard-body { grid-template-columns: minmax(0, 1.35fr) minmax(280px, 0.65fr); margin-top: 18px; }
+            .dashboard-main { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .metrics-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
             .field-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             .eyebrow {
@@ -754,6 +1039,45 @@ app, rt = fast_app(
                 padding: 14px 16px;
             }
             .source-item { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 14px; align-items: start; }
+            .recommend-card {
+                display: grid;
+                grid-template-columns: 96px minmax(0, 1fr);
+                gap: 12px;
+                padding: 12px;
+                border-radius: var(--radius-sm);
+                border: 1px solid var(--line);
+                background: linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(248, 241, 231, 0.94));
+                text-decoration: none;
+                color: inherit;
+                transition: transform 0.16s ease, box-shadow 0.16s ease;
+            }
+            .recommend-card:hover {
+                transform: translateY(-1px);
+                box-shadow: 0 12px 22px rgba(65, 42, 19, 0.08);
+            }
+            .recommend-thumb {
+                width: 96px;
+                height: 72px;
+                object-fit: cover;
+                border-radius: 12px;
+                background: rgba(22, 32, 51, 0.08);
+            }
+            .recommend-meta {
+                min-width: 0;
+                display: grid;
+                gap: 6px;
+            }
+            .recommend-stack {
+                display: grid;
+                gap: 12px;
+                margin-top: 16px;
+            }
+            .recommend-line {
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+                align-items: center;
+            }
             .source-num {
                 display: inline-grid;
                 place-items: center;
@@ -809,13 +1133,15 @@ app, rt = fast_app(
                 background: rgba(255, 255, 255, 0.62);
             }
             @media (max-width: 960px) {
-                .hero-grid, .workflow-grid, .dashboard-grid, .metrics-grid, .field-grid {
+                .hero-grid, .workflow-grid, .dashboard-grid, .dashboard-body, .dashboard-main, .metrics-grid, .field-grid {
                     grid-template-columns: 1fr;
                 }
                 .wrap { padding: 22px 14px 40px; }
                 .hero, .panel, .answer-shell { padding: 18px; }
                 .display { font-size: clamp(2rem, 11vw, 3rem); }
                 .source-item { grid-template-columns: 1fr; }
+                .recommend-card { grid-template-columns: 1fr; }
+                .recommend-thumb { width: 100%; height: 170px; }
             }
             """
         ),
@@ -861,7 +1187,7 @@ def summarize_skip_reason(reason: str) -> str:
     raw = (reason or "").strip()
     lower = raw.lower()
     if "429" in lower or "too many requests" in lower:
-        return "YouTube temporarily rate-limited transcript access for this video."
+        return "YouTube temporarily rate-limited transcript access for this video. TubeMind will try external transcript fallbacks when available."
     if "transcripts are disabled" in lower:
         return "This creator has disabled transcripts for the video."
     if "no transcripts are available" in lower or "no transcript found" in lower:
@@ -890,6 +1216,8 @@ def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
     job = status["job"]
     pct = progress_percent(job["progress"], job["total"])
     indexed_titles = youtube["titles"]
+    recommendations = youtube.get("recommendations", []) or []
+    rate_limit_count = sum(1 for item in status["skipped"] if "429" in str(item.get("reason", "")).lower() or "too many requests" in str(item.get("reason", "")).lower())
 
     indexed_items = [
         Div(
@@ -917,6 +1245,27 @@ def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
         for item in reversed(status["skipped"][-6:])
     ]
 
+    recommendation_items = [
+        A(
+            Img(src=item.get("thumbnail", ""), alt=item.get("title", "Recommended video"), cls="recommend-thumb") if item.get("thumbnail") else Div("No image", cls="empty-state"),
+            Div(
+                P(item.get("title", "Untitled video"), cls="item-title"),
+                P(item.get("channelTitle", "Unknown channel"), cls="item-copy"),
+                Div(
+                    Span(item.get("durationLabel", ""), cls="micro-pill") if item.get("durationLabel") else Span("Video", cls="micro-pill"),
+                    Span("Open on YouTube", cls="tiny"),
+                    cls="recommend-line",
+                ),
+                cls="recommend-meta",
+            ),
+            href=item.get("url", "#"),
+            target="_blank",
+            rel="noreferrer",
+            cls="recommend-card",
+        )
+        for item in recommendations[:MAX_RECOMMENDATIONS]
+    ]
+
     summary_children: List[Any] = [
         Span(badge_text, cls=f"status-pill {badge_tone}"),
         P(
@@ -934,6 +1283,17 @@ def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
         summary_children.append(
             Div(
                 P(notice, cls="item-copy"),
+                cls="skip-item",
+            )
+        )
+
+    if rate_limit_count:
+        summary_children.append(
+            Div(
+                P(
+                    "Transcript access is being rate-limited by YouTube. TubeMind now tries TranscriptAPI and other fallbacks, and the recommended videos panel still gives users direct access while indexing catches up.",
+                    cls="item-copy",
+                ),
                 cls="skip-item",
             )
         )
@@ -962,24 +1322,36 @@ def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
         Div(*summary_children, cls="panel"),
         Div(
             Div(
-                H3("Indexed Video Library", cls="section-title"),
-                P("Each successful transcript becomes part of the corpus that answers are drawn from.", cls="section-copy"),
-                Div(*indexed_items, cls="list-stack") if indexed_items else Div(
-                    P("Your indexed videos will appear here once TubeMind finishes building the corpus.", cls="item-copy"),
-                    cls="empty-state",
+                Div(
+                    H3("Indexed Video Library", cls="section-title"),
+                    P("Each successful transcript becomes part of the corpus that answers are drawn from.", cls="section-copy"),
+                    Div(*indexed_items, cls="list-stack") if indexed_items else Div(
+                        P("Your indexed videos will appear here once TubeMind finishes building the corpus.", cls="item-copy"),
+                        cls="empty-state",
+                    ),
+                    cls="panel",
                 ),
-                cls="panel",
+                Div(
+                    H3("Skipped or Unavailable Videos", cls="section-title"),
+                    P("TubeMind only works with videos that expose transcripts. This panel helps explain what was left out.", cls="section-copy"),
+                    Div(*skipped_items, cls="list-stack") if skipped_items else Div(
+                        P("No skipped videos so far. That usually means your current indexing run is healthy.", cls="item-copy"),
+                        cls="empty-state",
+                    ),
+                    cls="panel",
+                ),
+                cls="dashboard-main",
             ),
             Div(
-                H3("Skipped or Unavailable Videos", cls="section-title"),
-                P("TubeMind only works with videos that expose transcripts. This panel helps explain what was left out.", cls="section-copy"),
-                Div(*skipped_items, cls="list-stack") if skipped_items else Div(
-                    P("No skipped videos so far. That usually means your current indexing run is healthy.", cls="item-copy"),
+                H3("Recommended Videos", cls="section-title"),
+                P("Top matches for the current corpus topic. People can open these directly even before indexing finishes.", cls="section-copy"),
+                Div(*recommendation_items, cls="recommend-stack") if recommendation_items else Div(
+                    P("Search a topic and the top 5 recommended videos will appear here with thumbnails and links.", cls="item-copy"),
                     cls="empty-state",
                 ),
                 cls="panel",
             ),
-            cls="dashboard-grid",
+            cls="dashboard-body",
         ),
         id="dashboard-panels",
         _hx_get="/api/dashboard",
@@ -1040,16 +1412,16 @@ def home_page(msg: str = "", answer: str = "") -> Any:
             ),
             Div(
                 Div(
-                    Span(status_badge(s)[0], cls=f"status-pill {status_badge(s)[1]}"),
+                    Span("Fastest path to a useful corpus", cls="status-pill ready"),
                     P(
-                        s["youtube"]["seed_query"] and f'Current topic: "{s["youtube"]["seed_query"]}"' or "Choose a topic to get started.",
+                        "Start with a topic that naturally maps to 5 to 8 long-form videos, not a single exact video title.",
                         cls="section-copy",
                     ),
                     cls="panel tight",
                 ),
                 Div(
-                    P("A good first run uses 5 to 8 videos and a minimum length of 4 to 8 minutes.", cls="section-copy"),
-                    P("If some videos are skipped, TubeMind will explain whether captions were missing or YouTube throttled transcript access.", cls="section-copy"),
+                    P("Use the live dashboard below to watch indexing progress, see what made it into the corpus, and understand skipped videos.", cls="section-copy"),
+                    P("If some videos are skipped, TubeMind will tell you whether transcripts were missing or YouTube throttled access.", cls="section-copy"),
                     cls="panel tight",
                 ),
             ),

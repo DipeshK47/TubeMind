@@ -64,6 +64,8 @@ TRANSCRIPT_RETRY_ATTEMPTS = 3
 TRANSCRIPT_RETRY_BASE_DELAY = 1.0
 TRANSCRIPT_REQUEST_DELAY_SECONDS = 1.5
 TRANSCRIPT_CANDIDATE_PADDING = 2
+SSE_RETRY_MS = 1000
+HTMX_SSE_EXTENSION_URL = "https://cdn.jsdelivr.net/npm/htmx-ext-sse@2.2.2/sse.js"
 
 
 def load_environment() -> None:
@@ -197,6 +199,8 @@ class TubeMindApp:
         self._user_root.mkdir(parents=True, exist_ok=True)
         self.state = CorpusState.load(self._state_file)
         self.lock = threading.RLock()
+        self._dashboard_revision = 0
+        self._dashboard_condition = threading.Condition(self.lock)
         self._rag_loop = asyncio.new_event_loop()
         self._rag_loop_ready = threading.Event()
         self._rag_thread: Optional[threading.Thread] = None
@@ -291,7 +295,43 @@ class TubeMindApp:
             changed = True
 
         if changed:
-            self.state.save()
+            self._publish_dashboard_state()
+
+    def _publish_dashboard_state(self) -> None:
+        """Persist dashboard-visible state and notify any connected SSE listeners.
+
+        The dashboard stream needs one authoritative mutation checkpoint so state
+        writes and wake-ups stay in the same order. This helper saves the current
+        `CorpusState`, increments an in-memory dashboard revision, and notifies all
+        waiting listeners that a newer snapshot is available.
+
+        Callers are expected to hold `self.lock` before invoking this helper. That
+        keeps the saved file, revision bump, and condition notification consistent
+        with the exact in-memory state the UI should render next.
+        """
+        self.state.save()
+        self._dashboard_revision += 1
+        self._dashboard_condition.notify_all()
+
+    def wait_for_dashboard_update(
+        self,
+        last_revision: int,
+        timeout: float = 30.0,
+    ) -> tuple[int, Dict[str, Any]]:
+        """Block until a newer dashboard revision exists, then return that snapshot.
+
+        The SSE route waits in a worker thread, not on the async event loop, so it
+        can safely use this blocking condition-based helper. Returning the new
+        revision together with `status_payload()` lets the caller atomically advance
+        its cursor and emit exactly one HTML update per observed state change.
+
+        A timeout keeps idle connections from sleeping forever, which makes it
+        possible to periodically re-check whether the HTTP client has disconnected.
+        """
+        with self.lock:
+            if self._dashboard_revision <= last_revision:
+                self._dashboard_condition.wait(timeout=timeout)
+            return self._dashboard_revision, self.status_payload()
 
     def _youtube_video_id_from_doc_id(self, doc_id: str) -> str:
         if not doc_id.startswith("youtube:"):
@@ -454,9 +494,16 @@ class TubeMindApp:
             if self.state.job_id == "job_test":
                 self.state.job_id = ""
 
-            self.state.save()
+            self._publish_dashboard_state()
 
     def reset_youtube_index(self) -> None:
+        """Clear the current YouTube corpus state and publish the reset immediately.
+
+        Fresh indexing runs should not inherit stale recommendations, skipped-video
+        diagnostics, or finished progress text from older runs. Centralizing the
+        reset logic here keeps both HTMX responses and SSE subscribers aligned on
+        the same clean baseline before new indexing work begins.
+        """
         with self.lock:
             self.state.youtube_indexed = False
             self.state.youtube_seed_query = ""
@@ -471,15 +518,22 @@ class TubeMindApp:
             self.state.job_progress = 0
             self.state.job_total = 0
             self.state.job_message = ""
-            self.state.save()
+            self._publish_dashboard_state()
 
     def _set_job(self, *, active: bool, stage: str = "", progress: int = 0, total: int = 0, msg: str = "") -> None:
+        """Persist job progress fields and publish them to the live dashboard.
+
+        The dashboard header, progress bar, and status badge are all derived from
+        these job fields. Publishing from this shared method guarantees that every
+        stage transition becomes visible to connected SSE clients without requiring
+        each call site to remember a separate save-and-notify step.
+        """
         self.state.job_active = active
         self.state.job_stage = stage
         self.state.job_progress = progress
         self.state.job_total = total
         self.state.job_message = msg
-        self.state.save()
+        self._publish_dashboard_state()
 
     async def youtube_search(self, query: str, *, max_videos: int, min_seconds: int, order: str) -> List[YouTubeVideo]:
         key = os.environ["YOUTUBE_API_KEY"]
@@ -579,11 +633,18 @@ class TubeMindApp:
         }
 
     def _save_recommendations(self, videos: List[YouTubeVideo]) -> None:
+        """Persist the recommendation panel payload and publish the dashboard update.
+
+        Recommendations appear before transcript ingestion finishes, so they need to
+        reach the UI independently of final indexing success. This method keeps the
+        saved payload limited to the fields the dashboard actually renders and then
+        notifies SSE subscribers that the recommendation panel changed.
+        """
         self.state.youtube_recommendations = [
             self._serialize_recommendation(video)
             for video in videos[:MAX_RECOMMENDATIONS]
         ]
-        self.state.save()
+        self._publish_dashboard_state()
 
     def _transcript_request_kwargs(self) -> Dict[str, Any]:
         cookies_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
@@ -865,7 +926,6 @@ class TubeMindApp:
             self.state.job_id = job_id
             self.state.youtube_seed_query = normalized
             self._set_job(active=True, stage="search", progress=0, total=max_videos, msg="Searching YouTube...")
-            self.state.save()
 
             def runner():
                 try:
@@ -935,7 +995,7 @@ class TubeMindApp:
                             "reason": err or "unknown",
                         }
                     )
-                    self.state.save()
+                    self._publish_dashboard_state()
                 if consecutive_rate_limits >= 2 and not documents:
                     with self.lock:
                         self._set_job(
@@ -962,7 +1022,7 @@ class TubeMindApp:
                             "reason": "empty transcript",
                         }
                     )
-                    self.state.save()
+                    self._publish_dashboard_state()
                 continue
 
             doc = "\n\n".join(
@@ -1031,9 +1091,22 @@ class TubeMindApp:
                     done_msg += " (Most likely transcripts were disabled. Check skipped list.)"
             final_stage = "done" if indexed_count > 0 else "error"
             self._set_job(active=False, stage=final_stage, progress=indexed_count, total=indexed_count, msg=done_msg)
-            self.state.save()
 
-    async def query_youtube(self, question: str, mode: str = DEFAULT_QUERY_MODE) -> str:
+    async def query_youtube(self, question: str, mode: str = DEFAULT_QUERY_MODE) -> Dict[str, Any]:
+        """Return raw LightRAG retrieval data for a YouTube question.
+
+        This method intentionally avoids `aquery`, which would ask the configured
+        LLM to synthesize a final answer from the retrieved context. The product
+        requirement here is stricter: the response shown to the user must be the
+        transcript chunks retrieved from the indexed corpus, not a prose summary
+        generated by a model.
+
+        The returned payload keeps only the fields the UI and JSON API need for
+        direct evidence display: the normalized question, the retrieval mode, and
+        the ordered list of transcript chunks with their source metadata. That is
+        narrower than the raw `query_data` response on purpose so the rest of the
+        app does not accidentally drift back toward answer synthesis.
+        """
         q = question.strip()
         if not q:
             raise ValueError("Enter a question.")
@@ -1044,18 +1117,36 @@ class TubeMindApp:
 
         from lightrag import QueryParam
 
-        answer = str(
-            await self._run_coro_on_rag_loop(
-                self.rag.aquery(
-                    q,
-                    param=QueryParam(mode=mode, response_type="Multiple Paragraphs"),
-                )
+        result = await self._run_coro_on_rag_loop(
+            self.rag.aquery_data(
+                q,
+                param=QueryParam(mode=mode),
             )
-        ).strip()
+        )
+        chunks = list((result or {}).get("data", {}).get("chunks", []) or [])
 
-        if (not answer) or (answer.lower() in ("none", "null")):
-            raise RuntimeError("Empty answer. Try a simpler question or re-index different videos.")
-        return answer
+        if not chunks:
+            raise RuntimeError("No transcript chunks matched that question. Try a simpler question or re-index different videos.")
+
+        title_by_url = {url: title for title, url in self.state.youtube_urls.items()}
+        cleaned_chunks: List[Dict[str, str]] = []
+        for chunk in chunks:
+            file_path = str(chunk.get("file_path") or "").strip()
+            cleaned_chunks.append(
+                {
+                    "title": title_by_url.get(file_path, file_path or "Indexed transcript"),
+                    "url": file_path,
+                    "content": str(chunk.get("content") or "").strip(),
+                    "reference_id": str(chunk.get("reference_id") or "").strip(),
+                    "chunk_id": str(chunk.get("chunk_id") or "").strip(),
+                }
+            )
+
+        return {
+            "question": q,
+            "mode": mode,
+            "chunks": cleaned_chunks,
+        }
 
     def status_payload(self) -> Dict[str, Any]:
         s = self.state
@@ -1170,6 +1261,7 @@ app, rt = fast_app(
     pico=True,
     secret_key=SESSION_SECRET,
     hdrs=(
+        Script(src=HTMX_SSE_EXTENSION_URL),
         Link(
             rel="icon",
             href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%230f766e'/%3E%3Cpath d='M15 19h34L37 33v12H27V33z' fill='%23fff8ee'/%3E%3C/svg%3E",
@@ -1652,7 +1744,14 @@ def render_metric_card(label: str, value: str, hint: str) -> Any:
     )
 
 
-def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
+def render_dashboard_fragment(status: Dict[str, Any], notice: str = "") -> Any:
+    """Render the swappable dashboard content used by HTMX responses and SSE.
+
+    The live dashboard now separates connection ownership from content rendering.
+    This function returns only the inner dashboard fragment so it can be reused for
+    the initial page load, direct HTMX responses, and streamed SSE updates without
+    rebuilding the element that owns the SSE connection itself.
+    """
     badge_text, badge_tone = status_badge(status)
     youtube = status["youtube"]
     job = status["job"]
@@ -1796,13 +1895,38 @@ def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
             cls="dashboard-body",
         ),
         id="dashboard-panels",
-        _hx_get="/api/dashboard",
-        _hx_trigger="load, every 2s",
-        _hx_swap="outerHTML",
+        **{"sse-swap": "dashboard"},
     )
 
 
-def render_answer_panel(*, answer: str = "", error: str = "", indexed: bool = False) -> Any:
+def render_dashboard(status: Dict[str, Any], notice: str = "") -> Any:
+    """Render the stable dashboard shell that owns the HTMX SSE connection.
+
+    The inner dashboard body can be replaced many times during an indexing run, but
+    the connection owner must remain stable so HTMX does not open duplicate SSE
+    streams. This wrapper keeps the stream wiring fixed and nests the swappable
+    `#dashboard-panels` fragment inside it.
+    """
+    return Div(
+        render_dashboard_fragment(status, notice=notice),
+        id="dashboard-stream",
+        **{"hx-ext": "sse", "sse-connect": "/api/dashboard/stream"},
+    )
+
+
+def render_answer_panel(*, retrieval: Optional[Dict[str, Any]] = None, error: str = "", indexed: bool = False) -> Any:
+    """Render the answer area using retrieved transcript evidence instead of prose synthesis.
+
+    The answer panel previously displayed a single generated block of text, which
+    made the YouTube experience behave like an LLM summarizer. This renderer now
+    expects the structured retrieval payload from `query_youtube` and shows each
+    returned transcript chunk explicitly, together with the chunk's source link.
+
+    Keeping the rendering logic here separate from `query_youtube` preserves a
+    clean boundary: retrieval stays responsible for data shape, while the UI stays
+    responsible for presenting that evidence clearly in both the initial page load
+    and HTMX follow-up updates.
+    """
     if error:
         return Div(
             H3("Question Could Not Be Answered", cls="section-title"),
@@ -1810,11 +1934,31 @@ def render_answer_panel(*, answer: str = "", error: str = "", indexed: bool = Fa
             id="answer-panel",
             cls="answer-shell error",
         )
-    if answer:
+    if retrieval and retrieval.get("chunks"):
+        chunk_cards = [
+            Div(
+                Div(
+                    Span(f"Chunk {idx}", cls="micro-pill"),
+                    (
+                        A(chunk.get("title", "Source video"), href=chunk.get("url", "#"), target="_blank", rel="noreferrer", cls="item-title")
+                        if chunk.get("url")
+                        else P(chunk.get("title", "Indexed transcript"), cls="item-title")
+                    ),
+                    cls="inline-meta",
+                ),
+                Pre(chunk.get("content", ""), cls="answer-pre"),
+                cls="panel tight",
+            )
+            for idx, chunk in enumerate(retrieval["chunks"], start=1)
+        ]
         return Div(
-            H3("Answer", cls="section-title"),
-            P("Generated from the currently indexed YouTube transcript corpus.", cls="section-copy"),
-            Pre(answer, cls="answer-pre"),
+            H3("Retrieved Transcript Chunks", cls="section-title"),
+            P("Directly retrieved from the indexed YouTube transcript corpus. No summary was generated.", cls="section-copy"),
+            P(
+                f"Question: {retrieval.get('question', '')} | Mode: {str(retrieval.get('mode', DEFAULT_QUERY_MODE)).upper()}",
+                cls="small",
+            ),
+            Div(*chunk_cards, cls="list-stack"),
             id="answer-panel",
             cls="answer-shell",
         )
@@ -2024,7 +2168,53 @@ async def api_dashboard(request: Request, session):
     if not user:
         return RedirectResponse("/login", status_code=303)
     app_state = await get_user_app(user["id"])
-    return render_dashboard(app_state.status_payload())
+    return render_dashboard_fragment(app_state.status_payload())
+
+
+@rt("/api/dashboard/stream")
+async def api_dashboard_stream(request: Request, session):
+    """Stream dashboard HTML fragments over SSE for the authenticated user.
+
+    Each event contains fully rendered dashboard markup rather than JSON. That
+    keeps the UI server-rendered, matches the current FastHTML architecture, and
+    replaces the old polling loop with push-based updates only when state changes.
+    """
+    user = current_user(session)
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+
+    app_state = await get_user_app(user["id"])
+
+    async def event_stream():
+        with app_state.lock:
+            last_revision = app_state._dashboard_revision
+            initial_status = app_state.status_payload()
+
+        yield f"retry: {SSE_RETRY_MS}\n\n"
+        yield sse_message(render_dashboard_fragment(initial_status), event="dashboard")
+
+        while True:
+            if await request.is_disconnected():
+                break
+
+            next_revision, status = await asyncio.to_thread(
+                app_state.wait_for_dashboard_update,
+                last_revision,
+            )
+            if next_revision <= last_revision:
+                continue
+
+            last_revision = next_revision
+            yield sse_message(render_dashboard_fragment(status), event="dashboard")
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @rt("/api/search_youtube")
@@ -2077,12 +2267,12 @@ async def api_seed_youtube(request: Request, session, query: str = "", order: st
         job_id = app_state.start_youtube_index_job(query, max_videos=mv, min_seconds=ms, order=order)
     except ValueError as exc:
         if is_htmx:
-            return render_dashboard(app_state.status_payload(), notice=str(exc))
+            return render_dashboard_fragment(app_state.status_payload(), notice=str(exc))
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
     s = app_state.status_payload()
     if is_htmx:
-        return render_dashboard(s)
+        return render_dashboard_fragment(s)
     return {
         "ok": True,
         "job_id": job_id,
@@ -2097,10 +2287,10 @@ async def api_query_youtube(request: Request, session, question: str = "", mode:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
     app_state = await get_user_app(user["id"])
     try:
-        ans = await app_state.query_youtube(question, mode=mode)
+        retrieval = await app_state.query_youtube(question, mode=mode)
         if request.headers.get("hx-request", "").lower() == "true":
-            return render_answer_panel(answer=ans, indexed=app_state.state.youtube_indexed)
-        return {"ok": True, "answer": ans}
+            return render_answer_panel(retrieval=retrieval, indexed=app_state.state.youtube_indexed)
+        return {"ok": True, "retrieval": retrieval}
     except Exception as exc:
         if request.headers.get("hx-request", "").lower() == "true":
             return render_answer_panel(error=str(exc), indexed=app_state.state.youtube_indexed)

@@ -1,3 +1,8 @@
+"""TubeMind server entrypoint."""
+
+from fasthtml.common import serve
+
+from tubemind.routes import app
 from __future__ import annotations
 
 import asyncio

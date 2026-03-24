@@ -1,9 +1,9 @@
 """TubeMind server entrypoint."""
-
+from __future__ import annotations
 from fasthtml.common import serve
 
 from tubemind.routes import app
-from __future__ import annotations
+
 
 import asyncio
 import concurrent.futures
@@ -1124,7 +1124,8 @@ async def get_user_app(user_id: str) -> TubeMindApp:
         _user_locks[user_id] = asyncio.Lock()
     async with _user_locks[user_id]:
         if user_id not in _user_apps:
-            instance = TubeMindApp(user_id)
+            # TubeMindApp.__init__ calls future.result() which blocks — run in thread
+            instance = await asyncio.to_thread(TubeMindApp, user_id)
             await instance.startup()
             _user_apps[user_id] = instance
     return _user_apps[user_id]
@@ -1152,30 +1153,30 @@ def google_auth_url(state: str) -> str:
     return f"https://accounts.google.com/o/oauth2/v2/auth?{params}"
 
 
-def google_exchange_code(code: str) -> dict:
-    data = urlencode({
-        "code": code,
-        "client_id": GOOGLE_CLIENT_ID,
-        "client_secret": GOOGLE_CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI,
-        "grant_type": "authorization_code",
-    }).encode()
-    req = UrlRequest(
-        "https://oauth2.googleapis.com/token",
-        data=data,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
-    with urlopen(req) as resp:
-        return json.loads(resp.read())
+async def google_exchange_code(code: str) -> dict:
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "code": code,
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uri": REDIRECT_URI,
+                "grant_type": "authorization_code",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
-def google_userinfo(access_token: str) -> dict:
-    req = UrlRequest(
-        "https://www.googleapis.com/oauth2/v2/userinfo",
-        headers={"Authorization": f"Bearer {access_token}"},
-    )
-    with urlopen(req) as resp:
-        return json.loads(resp.read())
+async def google_userinfo(access_token: str) -> dict:
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 app, rt = fast_app(
@@ -1575,15 +1576,15 @@ def get_login(session, error: str = ""):
 
 
 @rt("/auth/callback")
-def get_auth_callback(request: Request, session, code: str = "", state: str = ""):
+async def get_auth_callback(request: Request, session, code: str = "", state: str = ""):
     if not code:
         return RedirectResponse("/login?error=no_code", status_code=303)
     if state != session.get("oauth_state"):
         return RedirectResponse("/login?error=bad_state", status_code=303)
     session.pop("oauth_state", None)
     try:
-        token_data = google_exchange_code(code)
-        info = google_userinfo(token_data["access_token"])
+        token_data = await google_exchange_code(code)
+        info = await google_userinfo(token_data["access_token"])
     except Exception:
         return RedirectResponse("/login?error=oauth_failed", status_code=303)
     user_id = str(info["id"])

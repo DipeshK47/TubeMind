@@ -140,16 +140,18 @@ class CorpusState:
     job_total: int = 0
     job_message: str = ""
 
-    # per-user path — not serialized
-    _state_file: Path = field(default=None, repr=False, compare=False)
+    # per-user id — not serialized
+    _user_id: str = field(default="", repr=False, compare=False)
 
     @classmethod
-    def load(cls, state_file: Path) -> "CorpusState":
-        if not state_file.exists():
+    def load(cls, user_id: str) -> "CorpusState":
+        try:
+            row = corpus_states_table[user_id]
+            data = json.loads(row["data"])
+        except Exception:
             obj = cls()
-            obj._state_file = state_file
+            obj._user_id = user_id
             return obj
-        data = json.loads(state_file.read_text(encoding="utf-8"))
         obj = cls(
             youtube_indexed=bool(data.get("youtube_indexed", False)),
             youtube_seed_query=str(data.get("youtube_seed_query", "")),
@@ -165,12 +167,11 @@ class CorpusState:
             job_total=int(data.get("job_total", 0)),
             job_message=str(data.get("job_message", "")),
         )
-        obj._state_file = state_file
+        obj._user_id = user_id
         return obj
 
     def save(self) -> None:
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        payload = json.dumps({
             "youtube_indexed": self.youtube_indexed,
             "youtube_seed_query": self.youtube_seed_query,
             "youtube_video_ids": self.youtube_video_ids,
@@ -184,18 +185,16 @@ class CorpusState:
             "job_progress": self.job_progress,
             "job_total": self.job_total,
             "job_message": self.job_message,
-        }
-        self._state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        })
+        corpus_states_table.upsert(dict(user_id=self._user_id, data=payload), pk="user_id")
 
 
 class TubeMindApp:
     def __init__(self, user_id: str) -> None:
         self.user_id = user_id
-        self._user_root = APP_ROOT / "users" / user_id / "tubemind_app"
-        self._rag_storage_dir = self._user_root / "rag_storage"
-        self._state_file = self._user_root / "state.json"
-        self._user_root.mkdir(parents=True, exist_ok=True)
-        self.state = CorpusState.load(self._state_file)
+        self._rag_storage_dir = APP_ROOT / "users" / user_id / "rag_storage"
+        self._rag_storage_dir.mkdir(parents=True, exist_ok=True)
+        self.state = CorpusState.load(user_id)
         self.lock = threading.RLock()
         self._rag_loop = asyncio.new_event_loop()
         self._rag_loop_ready = threading.Event()
@@ -1098,6 +1097,15 @@ db = database(str(APP_ROOT / "tubemind.db"))
 users_table = db.t.users
 if users_table not in db.t:
     users_table.create(dict(id=str, email=str, name=str, picture=str), pk="id")
+corpus_states_table = db.t.corpus_states
+if corpus_states_table not in db.t:
+    corpus_states_table.create(dict(user_id=str, data=str), pk="user_id")
+query_history_table = db.t.query_history
+if query_history_table not in db.t:
+    query_history_table.create(
+        dict(id=int, user_id=str, question=str, answer=str, mode=str, corpus_topic=str, created_at=int),
+        pk="id",
+    )
 
 # ── per-user app registry ─────────────────────────────────────────────────────
 _user_apps: Dict[str, TubeMindApp] = {}
@@ -1848,6 +1856,85 @@ def user_badge(user: Any) -> Any:
     )
 
 
+def save_query_history(user_id: str, question: str, answer: str, mode: str, corpus_topic: str) -> None:
+    try:
+        query_history_table.insert(dict(
+            user_id=user_id,
+            question=question,
+            answer=answer,
+            mode=mode,
+            corpus_topic=corpus_topic,
+            created_at=now_ms(),
+        ))
+    except Exception:
+        pass
+
+
+def format_ts(ms: int) -> str:
+    import datetime
+    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%b %d, %Y at %I:%M %p")
+
+
+def render_history_panel(user_id: str) -> Any:
+    try:
+        rows = list(query_history_table.rows_where(
+            "user_id = ?", [user_id],
+            order_by="created_at DESC",
+            limit=20,
+        ))
+    except Exception:
+        rows = []
+
+    if not rows:
+        return Div(
+            H3("Query History", cls="section-title"),
+            P("Your answered questions will appear here.", cls="section-copy"),
+            Div(
+                P("No queries yet. Ask a question above to get started.", cls="item-copy"),
+                cls="empty-state",
+            ),
+            id="history-panel",
+            cls="panel",
+        )
+
+    entries = [
+        Details(
+            Summary(
+                Div(
+                    Span(QUERY_MODE_LABELS.get(row["mode"], row["mode"]), cls="micro-pill"),
+                    Span(row["question"], style="font-weight:600;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"),
+                    Span(format_ts(row["created_at"]), cls="tiny"),
+                    style="display:flex;align-items:center;gap:10px;cursor:pointer;",
+                ),
+                style="list-style:none;",
+            ),
+            Div(
+                P(
+                    Span("Corpus: ", style="font-weight:600"),
+                    Span(row["corpus_topic"] or "—", cls="tiny"),
+                    cls="tiny",
+                    style="margin-bottom:8px",
+                ),
+                Pre(row["answer"], cls="answer-pre", style="margin:0;font-size:0.95rem;white-space:pre-wrap"),
+                style="padding:14px 0 4px;border-top:1px solid var(--line);margin-top:10px",
+            ),
+            style="border-radius:var(--radius-sm);border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,0.72),rgba(248,241,231,0.92));padding:14px 16px;",
+        )
+        for row in rows
+    ]
+
+    return Div(
+        Div(
+            H3("Query History", cls="section-title"),
+            P(f"Your last {len(rows)} question(s) asked against indexed corpora.", cls="section-copy"),
+            style="margin-bottom:14px",
+        ),
+        Div(*entries, cls="list-stack"),
+        id="history-panel",
+        cls="panel",
+    )
+
+
 def home_page(app_state: TubeMindApp, user: Any, msg: str = "", answer: str = "") -> Any:
     s = app_state.status_payload()
     return Div(
@@ -1991,6 +2078,13 @@ def home_page(app_state: TubeMindApp, user: Any, msg: str = "", answer: str = ""
             cls="workflow-grid",
         ),
         Div(
+            render_history_panel(user["id"]),
+            id="history-wrap",
+            _hx_get="/api/query_history",
+            _hx_trigger="historyUpdated from:body",
+            _hx_swap="outerHTML",
+        ),
+        Div(
             H3("Developer Tools", cls="section-title"),
             P("The main screen is designed for people, but the JSON endpoints are still available for debugging and scripting.", cls="section-copy"),
             Pre("Status:\ncurl -s http://localhost:5001/api/status | python3 -m json.tool\n\nSearch preview:\ncurl -s 'http://localhost:5001/api/search_youtube?q=machine%20learning&order=relevance&minSeconds=240' | python3 -m json.tool", cls="mono-copy"),
@@ -2098,13 +2192,35 @@ async def api_query_youtube(request: Request, session, question: str = "", mode:
     app_state = await get_user_app(user["id"])
     try:
         ans = await app_state.query_youtube(question, mode=mode)
+        save_query_history(
+            user_id=user["id"],
+            question=question,
+            answer=ans,
+            mode=mode,
+            corpus_topic=app_state.state.youtube_seed_query,
+        )
         if request.headers.get("hx-request", "").lower() == "true":
-            return render_answer_panel(answer=ans, indexed=app_state.state.youtube_indexed)
+            panel = render_answer_panel(answer=ans, indexed=app_state.state.youtube_indexed)
+            return panel, HtmxResponseHeaders(trigger="historyUpdated")
         return {"ok": True, "answer": ans}
     except Exception as exc:
         if request.headers.get("hx-request", "").lower() == "true":
             return render_answer_panel(error=str(exc), indexed=app_state.state.youtube_indexed)
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+
+@rt("/api/query_history")
+async def api_query_history(request: Request, session):
+    user = current_user(session)
+    if not user:
+        return RedirectResponse("/login", status_code=303)
+    return Div(
+        render_history_panel(user["id"]),
+        id="history-wrap",
+        _hx_get="/api/query_history",
+        _hx_trigger="historyUpdated from:body",
+        _hx_swap="outerHTML",
+    )
 
 
 if __name__ == "__main__":

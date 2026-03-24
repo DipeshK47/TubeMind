@@ -50,6 +50,9 @@ db = database(str(APP_ROOT / "tubemind.db"))
 users_table = db.t.users
 if users_table not in db.t:
     users_table.create(dict(id=str, email=str, name=str, picture=str), pk="id")
+corpus_states_table = db.t.corpus_states
+if corpus_states_table not in db.t:
+    corpus_states_table.create(dict(user_id=str, data=str), pk="user_id")
 
 
 # ── corpus state ──────────────────────────────────────────────────────────────
@@ -61,30 +64,36 @@ class CorpusState:
     indexed_page_ids: list[int] = field(default_factory=list)
     indexed_titles: list[str] = field(default_factory=list)
     page_urls: dict[str, str] = field(default_factory=dict)
+    _user_id: str = field(default="", repr=False, compare=False)
 
     @classmethod
-    def load(cls, state_file: Path) -> "CorpusState":
-        if not state_file.exists():
-            return cls()
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-        return cls(
+    def load(cls, user_id: str) -> "CorpusState":
+        try:
+            row = corpus_states_table[user_id]
+            data = json.loads(row["data"])
+        except Exception:
+            obj = cls()
+            obj._user_id = user_id
+            return obj
+        obj = cls(
             indexed=bool(data.get("indexed", False)),
             seed_query=str(data.get("seed_query", "")),
             indexed_page_ids=[int(p) for p in data.get("indexed_page_ids", [])],
             indexed_titles=[str(t) for t in data.get("indexed_titles", [])],
             page_urls={str(k): str(v) for k, v in data.get("page_urls", {}).items()},
         )
+        obj._user_id = user_id
+        return obj
 
-    def save(self, state_file: Path) -> None:
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+    def save(self) -> None:
+        payload = json.dumps({
             "indexed": self.indexed,
             "seed_query": self.seed_query,
             "indexed_page_ids": self.indexed_page_ids,
             "indexed_titles": self.indexed_titles,
             "page_urls": self.page_urls,
-        }
-        state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        })
+        corpus_states_table.upsert(dict(user_id=self._user_id, data=payload), pk="user_id")
 
 
 # ── per-user RAG app ──────────────────────────────────────────────────────────
@@ -92,11 +101,9 @@ class CorpusState:
 class WikiGraphApp:
     def __init__(self, user_id: str) -> None:
         self.user_id = user_id
-        self.user_dir = APP_ROOT / "users" / user_id
-        self.rag_dir = self.user_dir / "rag_storage"
-        self.state_file = self.user_dir / "state.json"
-        self.user_dir.mkdir(parents=True, exist_ok=True)
-        self.state = CorpusState.load(self.state_file)
+        self.rag_dir = APP_ROOT / "users" / user_id / "rag_storage"
+        self.rag_dir.mkdir(parents=True, exist_ok=True)
+        self.state = CorpusState.load(user_id)
         self.lock = threading.RLock()
         self.rag = self._create_rag()
 
@@ -172,7 +179,7 @@ class WikiGraphApp:
             self.rag.insert(documents, ids=ids, file_paths=file_paths)
             self.state.indexed = True
             self.state.seed_query = normalized_topic
-            self.state.save(self.state_file)
+            self.state.save()
 
             return {
                 "inserted_titles": inserted_titles,

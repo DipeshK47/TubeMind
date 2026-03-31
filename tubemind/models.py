@@ -1,23 +1,39 @@
-"""Core dataclasses and small shared helpers for TubeMind."""
+"""Shared dataclasses and formatting helpers for TubeMind's board workflow.
+
+The board-based UI stores most durable state in SQLite, but the application
+still benefits from typed in-memory objects for runtime orchestration and
+template rendering. This module keeps those small, cross-cutting structures in
+one place so the route, service, and UI layers all operate on the same shapes.
+"""
 
 from __future__ import annotations
 
-import json
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Optional
 
 
 def now_ms() -> int:
-    """Return a millisecond timestamp suitable for user-visible job ids."""
+    """Return the current UTC time in milliseconds for durable ordering fields.
+
+    TubeMind stores many user-facing timestamps in SQLite and JSON artifacts.
+    Using integer millisecond values keeps ordering inexpensive, avoids locale
+    concerns, and matches the existing lightweight persistence style across the
+    project.
+    """
 
     return int(time.time() * 1000)
 
 
 def iso8601_duration_to_seconds(duration: str) -> int:
-    """Convert a YouTube ISO-8601 duration like `PT12M34S` into seconds."""
+    """Convert a YouTube ISO-8601 duration like ``PT12M34S`` into seconds.
+
+    YouTube's API returns durations in ISO-8601 format, while the UI and
+    filtering logic need plain integer seconds for minimum-length filtering and
+    compact display labels.
+    """
 
     if not duration or not isinstance(duration, str) or not duration.startswith("PT"):
         return 0
@@ -31,7 +47,12 @@ def iso8601_duration_to_seconds(duration: str) -> int:
 
 
 def seconds_to_label(seconds: int) -> str:
-    """Format whole seconds into a compact UI-friendly label."""
+    """Format whole seconds into a compact human-friendly timestamp label.
+
+    The UI uses these labels for video duration chips and chunk start-time
+    references. Keeping this formatting helper shared prevents subtle
+    inconsistencies between board cards, detail pages, and retrieval metadata.
+    """
 
     if seconds <= 0:
         return ""
@@ -43,16 +64,26 @@ def seconds_to_label(seconds: int) -> str:
 
 
 def yt_watch_url(video_id: str, offset_seconds: Optional[float] = None) -> str:
-    """Build a canonical YouTube watch URL, optionally anchored to a timestamp."""
+    """Build a canonical YouTube watch URL, optionally anchored to a timestamp.
+
+    Note detail pages link users directly back to the supporting source video.
+    Returning a normalized watch URL here keeps that behavior consistent whether
+    the link came from a stored board video row or a retrieved chunk.
+    """
 
     if offset_seconds is None:
         return f"https://www.youtube.com/watch?v={video_id}"
-    return f"https://www.youtube.com/watch?v={video_id}&t={int(offset_seconds)}s"
+    return f"https://www.youtube.com/watch?v={video_id}&t={max(0, int(offset_seconds))}s"
 
 
-@dataclass
+@dataclass(slots=True)
 class YouTubeVideo:
-    """Normalized YouTube video metadata used throughout the app."""
+    """Normalized YouTube video metadata used before and after indexing.
+
+    The raw YouTube API responses are verbose and inconsistent across
+    endpoints. This object holds only the fields TubeMind needs for board
+    retrieval, note evidence rendering, and source deduplication.
+    """
 
     video_id: str
     title: str
@@ -63,81 +94,34 @@ class YouTubeVideo:
     url: str
 
 
-@dataclass
-class CorpusState:
-    """Persisted per-user TubeMind state for the dashboard and corpus metadata."""
+@dataclass(slots=True)
+class BoardRuntime:
+    """Hold the per-board LightRAG runtime and on-disk artifact locations.
 
-    youtube_indexed: bool = False
-    youtube_seed_query: str = ""
-    youtube_preferred_channels: List[str] = field(default_factory=list)
-    youtube_excluded_channels: List[str] = field(default_factory=list)
-    youtube_global_excluded_channels: List[str] = field(default_factory=list)
-    youtube_preferred_only: bool = False
-    youtube_video_ids: List[str] = field(default_factory=list)
-    youtube_titles: List[str] = field(default_factory=list)
-    youtube_urls: Dict[str, str] = field(default_factory=dict)
-    youtube_recommendations: List[Dict[str, Any]] = field(default_factory=list)
-    youtube_skipped: List[Dict[str, Any]] = field(default_factory=list)
-    job_active: bool = False
-    job_id: str = ""
-    job_stage: str = ""
-    job_progress: int = 0
-    job_total: int = 0
-    job_message: str = ""
-    _state_file: Path = field(default=None, repr=False, compare=False)
+    Each board owns its own cumulative knowledge base so follow-up notes stay
+    scoped to one topic instead of sharing a single corpus across the user.
+    Keeping the runtime metadata together makes it straightforward to lazily
+    create, cache, and later shut down board-specific resources.
+    """
 
-    @classmethod
-    def load(cls, state_file: Path) -> "CorpusState":
-        """Load the saved state for a user or initialize a new empty one."""
+    board_id: int
+    working_dir: Path
+    transcript_dir: Path
+    rag: object | None = None
 
-        if not state_file.exists():
-            obj = cls()
-            obj._state_file = state_file
-            return obj
-        data = json.loads(state_file.read_text(encoding="utf-8"))
-        obj = cls(
-            youtube_indexed=bool(data.get("youtube_indexed", False)),
-            youtube_seed_query=str(data.get("youtube_seed_query", "")),
-            youtube_preferred_channels=[str(x) for x in data.get("youtube_preferred_channels", [])],
-            youtube_excluded_channels=[str(x) for x in data.get("youtube_excluded_channels", [])],
-            youtube_global_excluded_channels=[str(x) for x in data.get("youtube_global_excluded_channels", [])],
-            youtube_preferred_only=bool(data.get("youtube_preferred_only", False)),
-            youtube_video_ids=[str(x) for x in data.get("youtube_video_ids", [])],
-            youtube_titles=[str(x) for x in data.get("youtube_titles", [])],
-            youtube_urls={str(k): str(v) for k, v in (data.get("youtube_urls", {}) or {}).items()},
-            youtube_recommendations=list(data.get("youtube_recommendations", []) or []),
-            youtube_skipped=list(data.get("youtube_skipped", []) or []),
-            job_active=bool(data.get("job_active", False)),
-            job_id=str(data.get("job_id", "")),
-            job_stage=str(data.get("job_stage", "")),
-            job_progress=int(data.get("job_progress", 0)),
-            job_total=int(data.get("job_total", 0)),
-            job_message=str(data.get("job_message", "")),
-        )
-        obj._state_file = state_file
-        return obj
 
-    def save(self) -> None:
-        """Persist the current state snapshot to disk for later recovery."""
+@dataclass(slots=True)
+class BoardWorkspace:
+    """Bundle the data needed to render the main board workspace in one object.
 
-        self._state_file.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "youtube_indexed": self.youtube_indexed,
-            "youtube_seed_query": self.youtube_seed_query,
-            "youtube_preferred_channels": self.youtube_preferred_channels,
-            "youtube_excluded_channels": self.youtube_excluded_channels,
-            "youtube_global_excluded_channels": self.youtube_global_excluded_channels,
-            "youtube_preferred_only": self.youtube_preferred_only,
-            "youtube_video_ids": self.youtube_video_ids,
-            "youtube_titles": self.youtube_titles,
-            "youtube_urls": self.youtube_urls,
-            "youtube_recommendations": self.youtube_recommendations,
-            "youtube_skipped": self.youtube_skipped,
-            "job_active": self.job_active,
-            "job_id": self.job_id,
-            "job_stage": self.job_stage,
-            "job_progress": self.job_progress,
-            "job_total": self.job_total,
-            "job_message": self.job_message,
-        }
-        self._state_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    The workspace route always needs the same coordinated pieces: the list of
+    boards for the sidebar, the currently active board, that board's notes, and
+    any transient notice or warning generated by the last action. Grouping
+    those fields avoids long parameter lists in the UI layer.
+    """
+
+    boards: list[dict]
+    active_board: dict | None
+    notes: list[dict] = field(default_factory=list)
+    notice: str = ""
+    warning: str = ""

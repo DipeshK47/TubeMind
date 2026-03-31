@@ -1,4 +1,4 @@
-"""TubeMind runtime services and per-user app registry."""
+"""Board-aware TubeMind runtime services."""
 
 from __future__ import annotations
 
@@ -13,17 +13,32 @@ import threading
 import time
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlparse
 
 import httpx
+from openai import AsyncOpenAI
 from youtube_transcript_api import NoTranscriptFound, TooManyRequests, YouTubeRequestFailed, YouTubeTranscriptApi
 
+from tubemind.auth import (
+    create_board,
+    create_board_note,
+    get_board_for_user,
+    list_board_notes,
+    list_board_videos,
+    list_boards,
+    replace_note_chunks,
+    save_note_queries,
+    set_active_board,
+    update_board,
+    upsert_board_videos,
+)
 from tubemind.config import (
     APP_ROOT,
     COOKIE_BROWSER_LABELS,
     DEFAULT_QUERY_MODE,
-    MAX_RECOMMENDATIONS,
+    MAX_VIDEOS_DEFAULT,
+    MIN_SECONDS_DEFAULT,
     QUERY_MODES,
     TRANSCRIPT_CANDIDATE_PADDING,
     TRANSCRIPT_RETRY_ATTEMPTS,
@@ -33,38 +48,57 @@ from tubemind.config import (
     YOUTUBE_SEARCH_URL,
     YOUTUBE_VIDEOS_URL,
 )
-from tubemind.models import CorpusState, YouTubeVideo, iso8601_duration_to_seconds, now_ms, seconds_to_label, yt_watch_url
+from tubemind.models import BoardRuntime, BoardWorkspace, YouTubeVideo, iso8601_duration_to_seconds, now_ms, seconds_to_label, yt_watch_url
 
 
 class TubeMindApp:
-    """Own all per-user state, background work, and LightRAG resources."""
+    """Own per-user board runtimes, OpenAI calls, and retrieval helpers."""
 
     def __init__(self, user_id: str) -> None:
+        """Create the per-user container that backs every board action."""
+
         self.user_id = user_id
-        self._user_root = APP_ROOT / "users" / user_id / "tubemind_app"
-        self._rag_storage_dir = self._user_root / "rag_storage"
-        self._state_file = self._user_root / "state.json"
-        self._user_root.mkdir(parents=True, exist_ok=True)
-        self.state = CorpusState.load(self._state_file)
-        self.lock = threading.RLock()
-        self._dashboard_revision = 0
-        self._dashboard_condition = threading.Condition(self.lock)
+        self._user_root = APP_ROOT / "users" / user_id
+        self._boards_root = self._user_root / "boards"
+        self._boards_root.mkdir(parents=True, exist_ok=True)
+        self._openai = AsyncOpenAI()
+        self._llm_model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano")
+        self._board_runtimes: dict[int, BoardRuntime] = {}
         self._rag_loop = asyncio.new_event_loop()
         self._rag_loop_ready = threading.Event()
         self._rag_thread: Optional[threading.Thread] = None
-        self.rag = None
+        self.lock = threading.RLock()
         self._start_rag_runtime()
-        self.rag = self._run_coro_on_rag_loop_sync(self._create_rag())
-        self._bg_thread: Optional[threading.Thread] = None
-        self._repair_state_after_restart()
+
+    async def startup(self) -> None:
+        """Keep the async service contract without eager board initialization."""
+
+        return None
+
+    async def shutdown(self) -> None:
+        """Finalize initialized board corpora and stop the dedicated RAG loop."""
+
+        for runtime in list(self._board_runtimes.values()):
+            if runtime.rag is not None:
+                try:
+                    await self._run_coro_on_rag_loop(runtime.rag.finalize_storages())
+                except Exception:
+                    pass
+        if self._rag_thread and self._rag_thread.is_alive():
+            self._rag_loop.call_soon_threadsafe(self._rag_loop.stop)
+            self._rag_thread.join(timeout=5)
 
     def _start_rag_runtime(self) -> None:
-        self._rag_thread = threading.Thread(target=self._run_rag_loop, name="tubemind-rag-loop", daemon=True)
+        """Start the background asyncio loop used for LightRAG operations."""
+
+        self._rag_thread = threading.Thread(target=self._run_rag_loop, name=f"tubemind-rag-{self.user_id}", daemon=True)
         self._rag_thread.start()
         if not self._rag_loop_ready.wait(timeout=5):
             raise RuntimeError("TubeMind could not start the LightRAG worker loop.")
 
     def _run_rag_loop(self) -> None:
+        """Run the dedicated event loop until shutdown."""
+
         asyncio.set_event_loop(self._rag_loop)
         self._rag_loop_ready.set()
         try:
@@ -80,11 +114,15 @@ class TubeMindApp:
             self._rag_loop.close()
 
     def _submit_coro_to_rag_loop(self, coro) -> concurrent.futures.Future[Any]:
+        """Submit one coroutine to the LightRAG loop."""
+
         if not self._rag_thread or not self._rag_thread.is_alive():
-            raise RuntimeError("TubeMind knowledge base worker is not running.")
+            raise RuntimeError("TubeMind knowledge-base worker is not running.")
         return asyncio.run_coroutine_threadsafe(coro, self._rag_loop)
 
     async def _run_coro_on_rag_loop(self, coro):
+        """Await work scheduled onto the LightRAG loop."""
+
         try:
             future = self._submit_coro_to_rag_loop(coro)
         except Exception:
@@ -92,470 +130,324 @@ class TubeMindApp:
             raise
         return await asyncio.wrap_future(future)
 
-    def _run_coro_on_rag_loop_sync(self, coro):
-        try:
-            future = self._submit_coro_to_rag_loop(coro)
-        except Exception:
-            coro.close()
-            raise
-        return future.result()
+    async def _create_rag(self, working_dir: Path):
+        """Create a LightRAG instance rooted at one board directory."""
 
-    async def _create_rag(self):
         from lightrag import LightRAG
         from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 
-        model = os.environ.get("OPENAI_MODEL", "gpt-4.1-nano")
-        llm_model = partial(openai_complete_if_cache, model)
-
+        llm_model = partial(openai_complete_if_cache, self._llm_model)
         return LightRAG(
-            working_dir=str(self._rag_storage_dir),
+            working_dir=str(working_dir),
             llm_model_func=llm_model,
             embedding_func=openai_embed,
         )
 
-    async def startup(self) -> None:
-        """Initialize persistent LightRAG storage and repair dashboard state."""
-
-        await self._run_coro_on_rag_loop(self.rag.initialize_storages())
-        await self._repair_rag_backed_state()
-
-    async def shutdown(self) -> None:
-        """Finalize storage and stop the dedicated worker loop cleanly."""
-
-        try:
-            await self._run_coro_on_rag_loop(self.rag.finalize_storages())
-        finally:
-            if self._rag_thread and self._rag_thread.is_alive():
-                self._rag_loop.call_soon_threadsafe(self._rag_loop.stop)
-                self._rag_thread.join(timeout=5)
-
-    def _repair_state_after_restart(self) -> None:
-        changed = False
-
-        if self.state.job_active:
-            self.state.job_active = False
-            self.state.job_stage = "interrupted"
-            self.state.job_message = "Previous indexing run was interrupted. Start indexing again."
-            changed = True
-
-        if not self.state.youtube_indexed and (
-            self.state.youtube_video_ids or self.state.youtube_titles or self.state.youtube_urls
-        ):
-            self.state.youtube_video_ids = []
-            self.state.youtube_titles = []
-            self.state.youtube_urls = {}
-            changed = True
-
-        if changed:
-            self._publish_dashboard_state()
-
-    def _publish_dashboard_state(self) -> None:
-        """Persist dashboard-visible state and wake SSE listeners waiting for updates."""
-
-        self.state.save()
-        self._dashboard_revision += 1
-        self._dashboard_condition.notify_all()
-
-    def wait_for_dashboard_update(self, last_revision: int, timeout: float = 30.0) -> tuple[int, Dict[str, Any]]:
-        """Block until the dashboard has a newer revision or the wait times out."""
+    async def _get_board_runtime(self, board_id: int) -> BoardRuntime:
+        """Return the lazily initialized runtime for one board."""
 
         with self.lock:
-            if self._dashboard_revision <= last_revision:
-                self._dashboard_condition.wait(timeout=timeout)
-            return self._dashboard_revision, self.status_payload()
+            cached = self._board_runtimes.get(board_id)
+        if cached is not None:
+            return cached
 
-    def _youtube_video_id_from_doc_id(self, doc_id: str) -> str:
-        if not doc_id.startswith("youtube:"):
-            return ""
-        return doc_id.split(":", 1)[1].strip()
-
-    def _extract_title_from_summary(self, summary: str) -> str:
-        match = re.search(r"(?m)^Title:\s*(.+)$", summary or "")
-        return match.group(1).strip() if match else ""
-
-    def _merge_skipped_items(self, existing: List[Dict[str, Any]], incoming: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        merged: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-
-        for item in [*existing, *incoming]:
-            key = (
-                str(item.get("videoId") or "").strip()
-                or str(item.get("url") or "").strip()
-                or str(item.get("title") or "").strip()
-            )
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            merged.append(item)
-
-        return merged[-30:]
-
-    def _parse_channel_filters(self, raw: str) -> List[str]:
-        """Split a comma/newline separated channel filter string into stable labels."""
-
-        seen: set[str] = set()
-        parsed: List[str] = []
-        for piece in re.split(r"[\n,]+", raw or ""):
-            label = re.sub(r"\s+", " ", piece).strip()
-            if not label:
-                continue
-            key = label.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            parsed.append(label)
-        return parsed
-
-    def _normalize_channel_label(self, label: str) -> str:
-        return re.sub(r"[^a-z0-9]+", " ", (label or "").casefold()).strip()
-
-    def _channel_matches_filters(self, channel_title: str, filters: List[str]) -> bool:
-        normalized_channel = self._normalize_channel_label(channel_title)
-        if not normalized_channel:
-            return False
-
-        for raw_filter in filters:
-            normalized_filter = self._normalize_channel_label(raw_filter)
-            if not normalized_filter:
-                continue
-            if normalized_filter in normalized_channel or normalized_channel in normalized_filter:
-                return True
-        return False
-
-    def _store_channel_filters(self, preferred_channels: List[str], excluded_channels: List[str], preferred_only: bool) -> None:
-        self.state.youtube_preferred_channels = preferred_channels
-        self.state.youtube_excluded_channels = excluded_channels
-        self.state.youtube_preferred_only = preferred_only
-
-    def _merge_channel_filters(self, *groups: List[str]) -> List[str]:
-        """Merge channel filters while keeping display values readable and unique."""
-
-        merged: List[str] = []
-        seen: set[str] = set()
-        for group in groups:
-            for channel in group or []:
-                normalized = self._normalize_channel_label(channel)
-                if not normalized or normalized in seen:
-                    continue
-                seen.add(normalized)
-                merged.append(str(channel).strip())
-        return merged
-
-    def _effective_excluded_channels(self, excluded_channels: Optional[List[str]] = None) -> List[str]:
-        """Combine run-specific exclusions with the user's saved global blacklist."""
-
-        with self.lock:
-            saved_blacklist = list(self.state.youtube_global_excluded_channels)
-        return self._merge_channel_filters(saved_blacklist, excluded_channels or [])
-
-    def save_global_channel_blacklist(self, raw_value: str) -> List[str]:
-        """Persist the user's always-on channel blacklist."""
-
-        parsed = self._parse_channel_filters(raw_value)
-        with self.lock:
-            self.state.youtube_global_excluded_channels = parsed
-            self._publish_dashboard_state()
-        return parsed
-
-    def _doc_item_key(self, doc_id: str, item: Dict[str, str]) -> str:
-        """Build a stable per-video key for deduplicating doc-status records."""
-
-        return str(item.get("videoId") or item.get("url") or item.get("title") or doc_id)
-
-    def _is_already_processed_duplicate(self, status_doc: Any) -> bool:
-        """Return True when LightRAG marks a reinserted processed document as failed."""
-
-        error_msg = str(getattr(status_doc, "error_msg", "") or "").lower()
-        return "content already exists." in error_msg and "status: processed" in error_msg
-
-    def _classify_doc_status_docs(
-        self,
-        docs: Dict[str, Any],
-        video_lookup: Optional[Dict[str, YouTubeVideo]] = None,
-    ) -> tuple[List[Dict[str, str]], List[Dict[str, str]]]:
-        from lightrag.base import DocStatus
-
-        successful_map: Dict[str, Dict[str, str]] = {}
-        failed_map: Dict[str, Dict[str, str]] = {}
-        video_lookup = video_lookup or {}
-        video_lookup_by_url = {video.url: video for video in video_lookup.values()}
-        order = {video_id: idx for idx, video_id in enumerate(video_lookup.keys())}
-
-        for doc_id, status_doc in docs.items():
-            video_id = self._youtube_video_id_from_doc_id(doc_id)
-            file_path = str(getattr(status_doc, "file_path", "") or "")
-            video = video_lookup.get(video_id)
-            if not video and file_path:
-                video = video_lookup_by_url.get(file_path)
-                if video and not video_id:
-                    video_id = video.video_id
-
-            title = (
-                video.title
-                if video
-                else self._extract_title_from_summary(str(getattr(status_doc, "content_summary", "") or ""))
-            )
-            title = title or file_path or doc_id
-            url = file_path or (video.url if video else yt_watch_url(video_id) if video_id else "")
-            thumbnail = video.thumbnail if video else ""
-
-            item = {
-                "videoId": video_id,
-                "title": title,
-                "url": url,
-                "thumbnail": thumbnail,
-            }
-            item_key = self._doc_item_key(doc_id, item)
-
-            status = getattr(status_doc, "status", None)
-            if status == DocStatus.PROCESSED or self._is_already_processed_duplicate(status_doc):
-                failed_map.pop(item_key, None)
-                successful_map.setdefault(item_key, item)
-            elif status == DocStatus.FAILED:
-                if item_key not in successful_map:
-                    failed_map.setdefault(
-                        item_key,
-                        {
-                            **item,
-                            "reason": f"Indexing failed: {str(getattr(status_doc, 'error_msg', '') or 'unknown error')}",
-                        },
-                    )
-
-        successful = list(successful_map.values())
-        failed = list(failed_map.values())
-
-        if order:
-            successful.sort(key=lambda item: order.get(item.get("videoId", ""), len(order)))
-            failed.sort(key=lambda item: order.get(item.get("videoId", ""), len(order)))
-
-        return successful, failed
-
-    async def _get_docs_by_status(self, status) -> Dict[str, Any]:
-        return await self._run_coro_on_rag_loop(self.rag.doc_status.get_docs_by_status(status))
-
-    async def _get_docs_by_track_id(self, track_id: str) -> Dict[str, Any]:
-        return await self._run_coro_on_rag_loop(self.rag.doc_status.get_docs_by_track_id(track_id))
-
-    async def _repair_rag_backed_state(self) -> None:
-        from lightrag.base import DocStatus
-
-        processed_docs = await self._get_docs_by_status(DocStatus.PROCESSED)
-        failed_docs = await self._get_docs_by_status(DocStatus.FAILED)
-        processing_docs = await self._get_docs_by_status(DocStatus.PROCESSING)
-        pending_docs = await self._get_docs_by_status(DocStatus.PENDING)
-
-        should_resume_queue = bool(processing_docs or pending_docs)
-        should_retry_failed_docs = bool(failed_docs) and any(
-            "reasoning_effort" in str(getattr(doc, "error_msg", "") or "").lower()
-            for doc in failed_docs.values()
+        board_root = self._boards_root / str(board_id)
+        runtime = BoardRuntime(
+            board_id=board_id,
+            working_dir=board_root / "rag_storage",
+            transcript_dir=board_root / "transcripts",
         )
-
-        if should_resume_queue or should_retry_failed_docs:
-            with self.lock:
-                self._set_job(
-                    active=True,
-                    stage="index",
-                    progress=0,
-                    total=len(processing_docs) + len(pending_docs) + len(failed_docs),
-                    msg="Repairing stored transcripts into a usable corpus...",
-                )
-            await self._run_coro_on_rag_loop(self.rag.apipeline_process_enqueue_documents())
-            processed_docs = await self._get_docs_by_status(DocStatus.PROCESSED)
-            failed_docs = await self._get_docs_by_status(DocStatus.FAILED)
-
-        successful, failed = self._classify_doc_status_docs({**processed_docs, **failed_docs})
-        rag_video_ids = {item["videoId"] for item in [*successful, *failed] if item.get("videoId")}
-
+        runtime.working_dir.mkdir(parents=True, exist_ok=True)
+        runtime.transcript_dir.mkdir(parents=True, exist_ok=True)
+        runtime.rag = await self._run_coro_on_rag_loop(self._create_rag(runtime.working_dir))
+        await self._run_coro_on_rag_loop(runtime.rag.initialize_storages())
         with self.lock:
-            prior_state_video_ids = set(self.state.youtube_video_ids)
-            self.state.youtube_indexed = bool(successful)
-            self.state.youtube_video_ids = [item["videoId"] for item in successful if item.get("videoId")]
-            self.state.youtube_titles = [item["title"] for item in successful]
-            self.state.youtube_urls = {
-                item["title"]: item["url"]
-                for item in successful
-                if item.get("title") and item.get("url")
+            self._board_runtimes[board_id] = runtime
+        return runtime
+
+    def build_workspace(self, active_board_id: int | None, *, notice: str = "", warning: str = "") -> BoardWorkspace:
+        """Assemble the sidebar and active board payload used by the UI."""
+
+        boards = list_boards(self.user_id)
+        active_board = get_board_for_user(self.user_id, active_board_id)
+        notes = list_board_notes(int(active_board["id"])) if active_board else []
+        return BoardWorkspace(boards=boards, active_board=active_board, notes=notes, notice=notice, warning=warning)
+
+    async def create_empty_board(self) -> BoardWorkspace:
+        """Create an empty board and make it the active workspace."""
+
+        board = create_board(self.user_id, "Untitled board", "", "", "idle")
+        set_active_board(self.user_id, int(board["id"]))
+        return self.build_workspace(int(board["id"]), notice="Created a new board.")
+
+    async def answer_question(self, board_id: int | None, question: str, mode: str = DEFAULT_QUERY_MODE) -> BoardWorkspace:
+        """Create a new note by reusing or expanding the selected board corpus."""
+
+        question_text = str(question or "").strip()
+        if not question_text:
+            raise ValueError("Enter a question to create a note.")
+        if mode not in QUERY_MODES:
+            mode = DEFAULT_QUERY_MODE
+
+        board = get_board_for_user(self.user_id, board_id) if board_id else None
+        if board is None:
+            board = create_board(self.user_id, question_text, question_text, "", "working")
+        board_id_int = int(board["id"])
+        set_active_board(self.user_id, board_id_int)
+
+        notes = list_board_notes(board_id_int)
+        if notes:
+            fit = await self._assess_topic_fit(board, notes, question_text)
+            if not fit["is_fit"]:
+                return self.build_workspace(board_id_int, warning=fit["warning"])
+
+        update_board(board_id_int, status="working", updated_at=now_ms())
+        runtime = await self._get_board_runtime(board_id_int)
+        initial = await self._query_board(board_id_int, runtime, question_text, mode, allow_empty=True)
+        plan = await self._plan_research(board, notes, question_text, initial)
+        queries = list(plan.get("queries") or [])
+        if not initial.get("chunks") and not queries:
+            queries = self._fallback_youtube_queries(board, question_text)
+
+        if queries:
+            await self._expand_board_corpus(board_id_int, runtime, queries)
+
+        result = initial
+        if queries or not result.get("chunks") or not str(result.get("answer", "") or "").strip():
+            result = await self._query_board(board_id_int, runtime, question_text, mode, allow_empty=False)
+
+        answer_text = str(result.get("answer") or "").strip()
+        if not result.get("chunks") and not answer_text:
+            update_board(board_id_int, status="error")
+            raise RuntimeError("TubeMind could not find enough transcript evidence for that note.")
+
+        note = create_board_note(
+            board_id=board_id_int,
+            question=question_text,
+            answer=answer_text or "TubeMind found evidence but could not synthesize a final answer.",
+            query_mode=mode,
+        )
+        save_note_queries(board_id_int, int(note["id"]), queries)
+        replace_note_chunks(int(note["id"]), result.get("chunks", []))
+        update_board(board_id_int, status="ready", last_question_at=now_ms(), updated_at=now_ms())
+        await self._refresh_board_summary(board_id_int)
+        return self.build_workspace(board_id_int, notice="Added a new note to the board.")
+
+    async def _assess_topic_fit(self, board: dict[str, Any], notes: list[dict[str, Any]], question: str) -> dict[str, Any]:
+        """Keep follow-up notes near the board topic instead of silently drifting."""
+
+        system_prompt = (
+            "Respond with JSON only: {\"is_fit\": boolean, \"warning\": string}. "
+            "Mark obviously different topics as not fitting, but allow natural follow-up questions."
+        )
+        prompt = json.dumps(
+            {
+                "board_title": board.get("title", ""),
+                "topic_anchor": board.get("topic_anchor", ""),
+                "recent_questions": [str(item.get("question", "") or "") for item in notes[-4:]],
+                "new_question": question,
+            }
+        )
+        result = await self._llm_json(system_prompt, prompt)
+        if isinstance(result, dict) and "is_fit" in result:
+            return {
+                "is_fit": bool(result.get("is_fit")),
+                "warning": str(result.get("warning", "") or "").strip() or "That question looks like a different topic. Start a new board for it instead.",
             }
 
-            if prior_state_video_ids and not prior_state_video_ids.issubset(rag_video_ids):
-                self.state.youtube_recommendations = []
-
-            non_index_failures = [
-                item
-                for item in self.state.youtube_skipped
-                if not str(item.get("reason", "")).startswith("Indexing failed:")
-            ]
-            self.state.youtube_skipped = self._merge_skipped_items(non_index_failures, failed)
-
-            self.state.job_active = False
-            self.state.job_progress = len(successful)
-            self.state.job_total = len(successful)
-
-            if successful:
-                self.state.job_stage = "done"
-                if should_resume_queue or should_retry_failed_docs:
-                    self.state.job_message = f"Recovered {len(successful)} indexed video(s) from stored transcripts."
-                else:
-                    self.state.job_message = f"Indexed {len(successful)} videos."
-            elif failed:
-                self.state.job_stage = "error"
-                if should_resume_queue or should_retry_failed_docs:
-                    self.state.job_message = "Stored transcripts were found, but rebuilding the corpus still failed. Check skipped videos for the latest error."
-                else:
-                    self.state.job_message = "Stored transcripts exist, but the corpus is not ready yet. Start indexing again to rebuild it."
-
-            if self.state.job_id == "job_test":
-                self.state.job_id = ""
-
-            self._publish_dashboard_state()
-
-    def reset_youtube_index(self, *, preserve_filters: bool = True) -> None:
-        """Clear the current corpus state before a new indexing run starts."""
-
-        with self.lock:
-            preferred_channels = list(self.state.youtube_preferred_channels) if preserve_filters else []
-            excluded_channels = list(self.state.youtube_excluded_channels) if preserve_filters else []
-            preferred_only = self.state.youtube_preferred_only if preserve_filters else False
-            self.state.youtube_indexed = False
-            self.state.youtube_seed_query = ""
-            self.state.youtube_preferred_channels = preferred_channels
-            self.state.youtube_excluded_channels = excluded_channels
-            self.state.youtube_preferred_only = preferred_only
-            self.state.youtube_video_ids = []
-            self.state.youtube_titles = []
-            self.state.youtube_urls = {}
-            self.state.youtube_recommendations = []
-            self.state.youtube_skipped = []
-            self.state.job_active = False
-            self.state.job_id = ""
-            self.state.job_stage = ""
-            self.state.job_progress = 0
-            self.state.job_total = 0
-            self.state.job_message = ""
-            self._publish_dashboard_state()
-
-    def _set_job(self, *, active: bool, stage: str = "", progress: int = 0, total: int = 0, msg: str = "") -> None:
-        """Persist job progress fields and publish them to the live dashboard."""
-
-        self.state.job_active = active
-        self.state.job_stage = stage
-        self.state.job_progress = progress
-        self.state.job_total = total
-        self.state.job_message = msg
-        self._publish_dashboard_state()
-
-    async def youtube_search(
-        self,
-        query: str,
-        *,
-        max_videos: int,
-        min_seconds: int,
-        order: str,
-        preferred_channels: Optional[List[str]] = None,
-        excluded_channels: Optional[List[str]] = None,
-        preferred_only: bool = False,
-    ) -> List[YouTubeVideo]:
-        """Search YouTube and normalize the returned videos for TubeMind use."""
-
-        key = os.environ["YOUTUBE_API_KEY"]
-
-        params = {
-            "part": "snippet",
-            "type": "video",
-            "maxResults": str(min(max_videos, 25)),
-            "q": query,
-            "order": order,
-            "key": key,
+        haystack = " ".join([str(board.get("topic_anchor", "") or ""), *[str(item.get("question", "") or "") for item in notes[-4:]]]).casefold()
+        overlap = {
+            token
+            for token in re.findall(r"[a-z0-9]+", question.casefold())
+            if len(token) > 2 and token in haystack
+        }
+        return {
+            "is_fit": bool(overlap),
+            "warning": "That question looks like a different topic. Start a new board for it instead.",
         }
 
+    async def _plan_research(
+        self,
+        board: dict[str, Any],
+        notes: list[dict[str, Any]],
+        question: str,
+        initial: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Decide whether the existing board corpus is enough for this note."""
+
+        board_videos = list_board_videos(int(board["id"]))
+        if not board_videos:
+            return {"queries": self._fallback_youtube_queries(board, question)}
+
+        system_prompt = (
+            "Respond with JSON only using keys needs_more (boolean), rationale (string), "
+            "queries (array of objects with query and reason). Generate 1-3 YouTube queries only when more evidence is needed."
+        )
+        prompt = json.dumps(
+            {
+                "board_title": board.get("title", ""),
+                "topic_anchor": board.get("topic_anchor", ""),
+                "recent_questions": [str(item.get("question", "") or "") for item in notes[-4:]],
+                "video_titles": [str(item.get("title", "") or "") for item in board_videos[-10:]],
+                "question": question,
+                "draft_answer": str(initial.get("answer", "") or ""),
+                "chunk_excerpts": [str(chunk.get("content", "") or "")[:240] for chunk in initial.get("chunks", [])[:4]],
+            }
+        )
+        result = await self._llm_json(system_prompt, prompt)
+        if not isinstance(result, dict):
+            return {"queries": [] if initial.get("chunks") else self._fallback_youtube_queries(board, question)}
+
+        queries = []
+        for item in list(result.get("queries") or [])[:3]:
+            query_text = str(item.get("query", "") or "").strip()
+            if query_text:
+                queries.append({"query": query_text, "reason": str(item.get("reason", "") or "").strip()})
+        return {"queries": queries if bool(result.get("needs_more")) else []}
+
+    async def _refresh_board_summary(self, board_id: int) -> None:
+        """Apply the board-title rules after each successful note insertion."""
+
+        notes = list_board_notes(board_id)
+        if not notes:
+            update_board(board_id, title="Untitled board", summary="", topic_anchor="")
+            return
+        if len(notes) == 1:
+            first = str(notes[0].get("question", "") or "").strip()
+            update_board(board_id, title=first, summary="", topic_anchor=first)
+            return
+        if len(notes) == 2:
+            update_board(
+                board_id,
+                title=f'{notes[0].get("question", "")} / {notes[1].get("question", "")}',
+                summary="",
+                topic_anchor=str(notes[0].get("question", "") or "").strip(),
+            )
+            return
+
+        result = await self._llm_json(
+            "Respond with JSON only using keys title, summary, topic_anchor. Keep the title short and the summary to one or two sentences.",
+            json.dumps(
+                {
+                    "questions": [str(item.get("question", "") or "") for item in notes[-6:]],
+                    "answers": [str(item.get("answer", "") or "")[:350] for item in notes[-6:]],
+                }
+            ),
+        )
+        if isinstance(result, dict) and str(result.get("title", "") or "").strip():
+            update_board(
+                board_id,
+                title=str(result.get("title", "") or "").strip(),
+                summary=str(result.get("summary", "") or "").strip(),
+                topic_anchor=str(result.get("topic_anchor", "") or "").strip() or str(notes[0].get("question", "") or "").strip(),
+            )
+            return
+
+        fallback = " / ".join(str(item.get("question", "") or "").strip() for item in notes[:3])
+        update_board(
+            board_id,
+            title=fallback,
+            summary="This board groups related questions answered from a shared YouTube research corpus.",
+            topic_anchor=str(notes[0].get("question", "") or "").strip(),
+        )
+
+    async def _llm_json(self, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
+        """Ask the configured OpenAI model for a small JSON object."""
+
+        try:
+            response = await self._openai.responses.create(
+                model=self._llm_model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+        except Exception:
+            return None
+
+        text = str(getattr(response, "output_text", "") or "").strip()
+        if not text:
+            return None
+        try:
+            payload = json.loads(text)
+            return payload if isinstance(payload, dict) else None
+        except Exception:
+            match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+            if not match:
+                return None
+            try:
+                payload = json.loads(match.group(0))
+                return payload if isinstance(payload, dict) else None
+            except Exception:
+                return None
+
+    def _fallback_youtube_queries(self, board: dict[str, Any], question: str) -> list[dict[str, str]]:
+        """Generate deterministic search queries when the planning model fails."""
+
+        anchor = str(board.get("topic_anchor", "") or "").strip()
+        queries = [{"query": question, "reason": "Direct search for the current note question."}]
+        if anchor and anchor.casefold() not in question.casefold():
+            queries.append({"query": f"{anchor} {question}".strip(), "reason": "Keep the search anchored to the board topic."})
+        return queries[:2]
+
+    async def youtube_search(self, query: str, *, max_videos: int, min_seconds: int, order: str) -> list[YouTubeVideo]:
+        """Search YouTube and normalize the result list for indexing."""
+
+        key = os.environ["YOUTUBE_API_KEY"]
+        params = {"part": "snippet", "type": "video", "maxResults": str(min(max_videos, 25)), "q": query, "order": order, "key": key}
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(YOUTUBE_SEARCH_URL, params=params)
             data = response.json()
             if response.status_code != 200:
                 raise RuntimeError(f"YouTube search failed: {data}")
 
-        items = data.get("items", [])
-        video_ids = [it.get("id", {}).get("videoId") for it in items]
+        video_ids = [str(item.get("id", {}).get("videoId") or "").strip() for item in data.get("items", [])]
         video_ids = [video_id for video_id in video_ids if video_id]
         if not video_ids:
             return []
 
-        params2 = {
-            "part": "snippet,contentDetails",
-            "id": ",".join(video_ids),
-            "key": key,
-        }
-
+        params2 = {"part": "snippet,contentDetails", "id": ",".join(video_ids), "key": key}
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(YOUTUBE_VIDEOS_URL, params=params2)
             data2 = response.json()
             if response.status_code != 200:
                 raise RuntimeError(f"YouTube videos.list failed: {data2}")
 
-        videos: List[YouTubeVideo] = []
+        videos: list[YouTubeVideo] = []
         for item in data2.get("items", []):
-            video_id = str(item.get("id", ""))
-            snippet = item.get("snippet", {}) or {}
-            content_details = item.get("contentDetails", {}) or {}
-            duration = iso8601_duration_to_seconds(str(content_details.get("duration", "") or ""))
-
-            thumbnails = snippet.get("thumbnails", {}) or {}
-            thumbnail = (
-                (thumbnails.get("medium") or {}).get("url")
-                or (thumbnails.get("high") or {}).get("url")
-                or (thumbnails.get("default") or {}).get("url")
-                or ""
-            )
-
+            duration = iso8601_duration_to_seconds(str((item.get("contentDetails") or {}).get("duration", "") or ""))
             if duration < min_seconds:
                 continue
-
+            snippet = item.get("snippet", {}) or {}
+            thumbs = snippet.get("thumbnails", {}) or {}
+            thumbnail = (thumbs.get("medium") or {}).get("url") or (thumbs.get("high") or {}).get("url") or (thumbs.get("default") or {}).get("url") or ""
+            video_id = str(item.get("id", "") or "").strip()
             videos.append(
                 YouTubeVideo(
                     video_id=video_id,
-                    title=str(snippet.get("title", "")),
-                    channel_title=str(snippet.get("channelTitle", "")),
-                    published_at=str(snippet.get("publishedAt", "")),
+                    title=str(snippet.get("title", "") or "").strip(),
+                    channel_title=str(snippet.get("channelTitle", "") or "").strip(),
+                    published_at=str(snippet.get("publishedAt", "") or "").strip(),
                     thumbnail=thumbnail,
                     duration_sec=duration,
                     url=yt_watch_url(video_id),
                 )
             )
-
-        preferred_channels = preferred_channels or []
-        excluded_channels = self._effective_excluded_channels(excluded_channels)
-
-        if excluded_channels:
-            videos = [
-                video
-                for video in videos
-                if not self._channel_matches_filters(video.channel_title, excluded_channels)
-            ]
-
-        if preferred_channels:
-            matching = [
-                video
-                for video in videos
-                if self._channel_matches_filters(video.channel_title, preferred_channels)
-            ]
-            if preferred_only:
-                videos = matching
-            else:
-                matching_ids = {video.video_id for video in matching}
-                videos = matching + [video for video in videos if video.video_id not in matching_ids]
-
         return videos[:max_videos]
 
     def _transcript_candidate_pool(self, max_videos: int) -> int:
+        """Pad the initial result pool to offset transcript failures."""
+
         raw_pad = str(os.environ.get("YOUTUBE_TRANSCRIPT_CANDIDATE_PADDING", TRANSCRIPT_CANDIDATE_PADDING))
         try:
             pad = int(raw_pad)
         except ValueError:
             pad = TRANSCRIPT_CANDIDATE_PADDING
-        pad = max(0, min(8, pad))
-        return min(25, max_videos + pad)
+        return min(25, max_videos + max(0, min(8, pad)))
 
     def _transcript_request_delay(self) -> float:
+        """Return the configured pause between transcript fetches."""
+
         raw = str(os.environ.get("YOUTUBE_TRANSCRIPT_REQUEST_DELAY_SECONDS", TRANSCRIPT_REQUEST_DELAY_SECONDS))
         try:
             delay = float(raw)
@@ -563,68 +455,38 @@ class TubeMindApp:
             delay = TRANSCRIPT_REQUEST_DELAY_SECONDS
         return max(0.0, min(10.0, delay))
 
-    def _transcript_cache_dir(self) -> Path:
-        """Return the directory that stores timestamp-preserving transcript artifacts."""
-
-        path = self._user_root / "transcripts"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def _transcript_cache_path(self, video_id: str) -> Path:
-        """Return the artifact path for one video's timestamp-preserving transcript."""
-
-        return self._transcript_cache_dir() / f"{video_id}.json"
-
     def _normalize_alignment_text(self, text: str) -> str:
-        """Normalize transcript text so retrieved chunks can be aligned back to segments.
-
-        LightRAG chunking may change whitespace, and transcript providers can emit
-        noisy line breaks or repeated spacing. This normalization keeps only the
-        semantic text needed for rough substring alignment while preserving a stable
-        character offset model for timestamp lookup.
-        """
+        """Normalize transcript text for chunk-to-timestamp alignment."""
 
         cleaned = re.sub(r"\s+", " ", text or "").strip().lower()
         return re.sub(r"[^a-z0-9 ]+", "", cleaned)
 
-    def _build_clean_transcript_artifact(self, video: YouTubeVideo, segments: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Create the clean transcript text and timestamp lookup artifact for one video.
+    def _transcript_cache_path(self, runtime: BoardRuntime, video_id: str) -> Path:
+        """Return the board-local transcript artifact path for one video."""
 
-        TubeMind now stores two representations of each transcript on purpose.
-        LightRAG receives only the clean text without `[t=...]` markers so retrieval
-        quality is not polluted by timestamp tokens, while the sidecar artifact keeps
-        enough segment timing data to reconnect retrieved chunks to their video time.
-        """
+        return runtime.transcript_dir / f"{video_id}.json"
 
-        clean_parts: List[str] = []
-        normalized_parts: List[str] = []
-        artifact_segments: List[Dict[str, Any]] = []
-        normalized_cursor = 0
+    def _build_clean_transcript_artifact(self, video: YouTubeVideo, segments: list[dict[str, Any]]) -> dict[str, Any]:
+        """Create the clean transcript text plus a timing sidecar artifact."""
 
+        clean_parts: list[str] = []
+        normalized_parts: list[str] = []
+        artifact_segments: list[dict[str, Any]] = []
+        cursor = 0
         for segment in segments:
             cleaned_text = re.sub(r"\s+", " ", str(segment.get("text", "") or "")).strip()
             if not cleaned_text:
                 continue
-
             clean_parts.append(cleaned_text)
-            normalized_text = self._normalize_alignment_text(cleaned_text)
-            if not normalized_text:
+            normalized = self._normalize_alignment_text(cleaned_text)
+            if not normalized:
                 continue
-
             if normalized_parts:
-                normalized_cursor += 1
-            offset_start = normalized_cursor
-            normalized_parts.append(normalized_text)
-            normalized_cursor += len(normalized_text)
-            artifact_segments.append(
-                {
-                    "start": float(segment.get("start", 0.0) or 0.0),
-                    "text": cleaned_text,
-                    "offset_start": offset_start,
-                    "offset_end": normalized_cursor,
-                }
-            )
-
+                cursor += 1
+            offset_start = cursor
+            normalized_parts.append(normalized)
+            cursor += len(normalized)
+            artifact_segments.append({"start": float(segment.get("start", 0.0) or 0.0), "text": cleaned_text, "offset_start": offset_start, "offset_end": cursor})
         return {
             "video_id": video.video_id,
             "url": video.url,
@@ -633,106 +495,73 @@ class TubeMindApp:
             "segments": artifact_segments,
         }
 
-    def _save_transcript_artifact(self, video: YouTubeVideo, segments: List[Dict[str, Any]]) -> str:
-        """Persist the timestamp-preserving transcript artifact and return clean text.
-
-        The returned text is what gets inserted into LightRAG. The artifact on disk
-        is intentionally richer than the ingested text because it exists only to map
-        retrieved chunks back to a start time for embeds and source links.
-        """
+    def _save_transcript_artifact(self, runtime: BoardRuntime, video: YouTubeVideo, segments: list[dict[str, Any]]) -> str:
+        """Persist the timing sidecar and return the clean transcript text."""
 
         artifact = self._build_clean_transcript_artifact(video, segments)
-        self._transcript_cache_path(video.video_id).write_text(json.dumps(artifact, indent=2), encoding="utf-8")
+        self._transcript_cache_path(runtime, video.video_id).write_text(json.dumps(artifact, indent=2), encoding="utf-8")
         return str(artifact.get("clean_text", "") or "").strip()
 
     def _video_id_from_url(self, url: str) -> str:
-        """Extract the YouTube video id from a stored watch URL."""
+        """Extract a YouTube video id from a stored watch URL."""
 
         try:
-            parsed = urlparse(url)
-            return str(parse_qs(parsed.query).get("v", [""])[0] or "").strip()
+            return str(parse_qs(urlparse(url).query).get("v", [""])[0] or "").strip()
         except Exception:
             return ""
 
     def _youtube_embed_url(self, video_id: str, start_seconds: float) -> str:
-        """Build an embeddable YouTube URL anchored to the retrieved start time."""
+        """Build an embeddable YouTube URL anchored to a chunk timestamp."""
 
         return f"https://www.youtube.com/embed/{video_id}?start={max(0, int(start_seconds))}&rel=0"
 
-    def _find_chunk_start_seconds(self, video_id: str, chunk_text: str) -> float:
-        """Approximate the start time for a retrieved chunk using the sidecar artifact.
+    def _find_chunk_start_seconds(self, runtime: BoardRuntime, video_id: str, chunk_text: str) -> float:
+        """Approximate a retrieved chunk's start time from the saved transcript artifact."""
 
-        LightRAG only returns the clean chunk content, not timing metadata. This
-        helper aligns the retrieved text back onto the normalized full transcript and
-        then finds the segment whose range covers that position.
-        """
-
-        artifact_path = self._transcript_cache_path(video_id)
+        artifact_path = self._transcript_cache_path(runtime, video_id)
         if not artifact_path.exists():
             return 0.0
-
         try:
             artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
         except Exception:
             return 0.0
-
         normalized_chunk = self._normalize_alignment_text(chunk_text)
-        if not normalized_chunk:
-            return 0.0
-
         normalized_transcript = str(artifact.get("normalized_text", "") or "")
-        if not normalized_transcript:
+        if not normalized_chunk or not normalized_transcript:
             return 0.0
-
         offset = normalized_transcript.find(normalized_chunk)
         if offset < 0:
             excerpt = normalized_chunk[:120]
-            if not excerpt:
-                return 0.0
-            offset = normalized_transcript.find(excerpt)
+            if excerpt:
+                offset = normalized_transcript.find(excerpt)
         if offset < 0:
             return 0.0
-
         for segment in artifact.get("segments", []) or []:
             if int(segment.get("offset_end", 0) or 0) >= offset:
                 return float(segment.get("start", 0.0) or 0.0)
         return 0.0
 
-    def _serialize_recommendation(self, video: YouTubeVideo) -> Dict[str, Any]:
-        return {
-            "videoId": video.video_id,
-            "title": video.title,
-            "channelTitle": video.channel_title,
-            "durationSec": video.duration_sec,
-            "durationLabel": seconds_to_label(video.duration_sec),
-            "thumbnail": video.thumbnail,
-            "url": video.url,
-        }
+    def _transcript_request_kwargs(self) -> dict[str, Any]:
+        """Return optional cookie-file settings for transcript requests."""
 
-    def _save_recommendations(self, videos: List[YouTubeVideo]) -> None:
-        """Persist the recommendation panel payload and publish the update immediately."""
-
-        self.state.youtube_recommendations = [
-            self._serialize_recommendation(video) for video in videos[:MAX_RECOMMENDATIONS]
-        ]
-        self._publish_dashboard_state()
-
-    def _transcript_request_kwargs(self) -> Dict[str, Any]:
         cookies_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
-        if not cookies_file:
-            return {}
-        return {"cookies": cookies_file}
+        return {"cookies": cookies_file} if cookies_file else {}
 
     def _transcript_api_key(self) -> str:
+        """Return the configured TranscriptAPI key when present."""
+
         return str(os.environ.get("TRANSCRIPTAPI_API_KEY", "")).strip()
 
     def _is_transcript_rate_limited(self, exc: Exception) -> bool:
+        """Detect transcript rate-limit conditions across providers."""
+
         if isinstance(exc, TooManyRequests):
             return True
-        text = str(exc).lower()
-        return "429" in text or "too many requests" in text
+        return "429" in str(exc).lower() or "too many requests" in str(exc).lower()
 
     def _should_retry_transcript_error(self, exc: Exception) -> bool:
+        """Decide whether a transcript failure is transient enough to retry."""
+
         if self._is_transcript_rate_limited(exc):
             return True
         if isinstance(exc, YouTubeRequestFailed):
@@ -741,47 +570,16 @@ class TubeMindApp:
         return False
 
     def _describe_transcript_error(self, exc: Exception, *, using_cookies: bool) -> str:
-        msg = f"{type(exc).__name__}: {str(exc)}"
+        """Convert transcript exceptions into readable diagnostics."""
+
+        message = f"{type(exc).__name__}: {str(exc)}"
         if self._is_transcript_rate_limited(exc) and not using_cookies:
-            return (
-                f"{msg}\nHint: export a YouTube browser cookie file and set "
-                "YOUTUBE_TRANSCRIPT_COOKIES_FILE to reduce transcript 429s."
-            )
-        return msg
-
-    def _looks_rate_limited(self, reason: str) -> bool:
-        lower = (reason or "").lower()
-        return "429" in lower or "too many requests" in lower or "rate-limit" in lower
-
-    def _yt_dlp_cookie_sources(self) -> List[tuple[str, Dict[str, Any]]]:
-        sources: List[tuple[str, Dict[str, Any]]] = [("yt-dlp", {})]
-
-        cookie_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
-        if cookie_file:
-            sources.append(("yt-dlp + cookie file", {"cookiefile": cookie_file}))
-
-        browsers_raw = str(os.environ.get("YOUTUBE_COOKIES_BROWSER", "")).strip()
-        for browser in [value.strip().lower() for value in browsers_raw.split(",") if value.strip()]:
-            sources.append(
-                (
-                    f"yt-dlp + {COOKIE_BROWSER_LABELS.get(browser, browser.title())} cookies",
-                    {"cookiesfrombrowser": (browser, None, None, None)},
-                )
-            )
-
-        return sources
-
-    class _QuietYTDLPLogger:
-        def debug(self, msg: str) -> None:
-            return None
-
-        def warning(self, msg: str) -> None:
-            return None
-
-        def error(self, msg: str) -> None:
-            return None
+            return f"{message}\nHint: set YOUTUBE_TRANSCRIPT_COOKIES_FILE to reduce transcript 429s."
+        return message
 
     def _extract_transcriptapi_error(self, payload: Any) -> str:
+        """Normalize TranscriptAPI error payloads into one short string."""
+
         detail = payload.get("detail") if isinstance(payload, dict) else None
         if isinstance(detail, dict):
             return str(detail.get("message") or detail.get("detail") or detail)
@@ -791,42 +589,32 @@ class TubeMindApp:
             return str(payload.get("message") or payload)
         return str(payload)
 
-    def _fetch_transcript_with_transcriptapi(self, video: YouTubeVideo) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    def _fetch_transcript_with_transcriptapi(self, video: YouTubeVideo) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+        """Try TranscriptAPI before falling back to other transcript sources."""
+
         api_key = self._transcript_api_key()
         if not api_key:
             return None, None
-
-        request_headers = {"Authorization": f"Bearer {api_key}"}
-        request_params = {"platform": "youtube", "video_id": video.video_id}
+        headers = {"Authorization": f"Bearer {api_key}"}
+        params = {"platform": "youtube", "video_id": video.video_id}
         last_err = "unknown TranscriptAPI error"
         retry_delay = 1.0
-
         with httpx.Client(timeout=30.0) as client:
             for _ in range(3):
-                response = client.get(
-                    f"{TRANSCRIPTAPI_BASE_URL}/transcripts",
-                    params=request_params,
-                    headers=request_headers,
-                )
+                response = client.get(f"{TRANSCRIPTAPI_BASE_URL}/transcripts", params=params, headers=headers)
                 if response.status_code == 200:
                     payload = response.json()
                     cues = payload.get("transcript", []) if isinstance(payload, dict) else []
-                    segments = [
-                        {"start": float(cue.get("start", 0.0) or 0.0), "text": str(cue.get("text", "")).strip()}
-                        for cue in cues
-                        if str(cue.get("text", "")).strip()
-                    ]
+                    segments = [{"start": float(cue.get("start", 0.0) or 0.0), "text": str(cue.get("text", "")).strip()} for cue in cues if str(cue.get("text", "")).strip()]
                     if segments:
                         return segments, None
                     last_err = "TranscriptAPI returned an empty transcript"
                     break
-
                 try:
                     payload = response.json()
                 except Exception:
                     payload = {"detail": response.text}
                 last_err = self._extract_transcriptapi_error(payload)
-
                 if response.status_code in (408, 429, 503):
                     retry_after = response.headers.get("Retry-After")
                     try:
@@ -837,10 +625,11 @@ class TubeMindApp:
                     retry_delay = min(retry_delay * 2, 10.0)
                     continue
                 break
-
         return None, f"TranscriptAPI: {last_err}"
 
     def _parse_seconds_label(self, value: str) -> float:
+        """Parse a VTT timestamp into float seconds."""
+
         clean = value.strip().replace(",", ".")
         parts = clean.split(":")
         if len(parts) == 3:
@@ -851,54 +640,81 @@ class TubeMindApp:
             return int(minutes) * 60 + float(seconds)
         return float(clean)
 
-    def _parse_vtt_segments(self, text: str) -> List[Dict[str, Any]]:
+    def _parse_vtt_segments(self, text: str) -> list[dict[str, Any]]:
+        """Parse subtitle cues from a VTT file."""
+
         lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        segments: List[Dict[str, Any]] = []
+        segments: list[dict[str, Any]] = []
         index = 0
         while index < len(lines):
             line = lines[index].strip()
             if "-->" not in line:
                 index += 1
                 continue
-
             start_raw = line.split("-->", 1)[0].strip().split(" ")[0]
             index += 1
-            cue_lines: List[str] = []
+            cue_lines: list[str] = []
             while index < len(lines) and lines[index].strip():
                 cue_lines.append(lines[index].strip())
                 index += 1
-
-            cue_text = re.sub(r"<[^>]+>", "", " ".join(cue_lines)).strip()
-            cue_text = html.unescape(cue_text)
+            cue_text = html.unescape(re.sub(r"<[^>]+>", "", " ".join(cue_lines)).strip())
             if cue_text:
                 segments.append({"start": self._parse_seconds_label(start_raw), "text": cue_text})
         return segments
 
-    def _parse_json3_segments(self, text: str) -> List[Dict[str, Any]]:
+    def _parse_json3_segments(self, text: str) -> list[dict[str, Any]]:
+        """Parse subtitle cues from a YouTube json3 subtitle file."""
+
         payload = json.loads(text)
-        segments: List[Dict[str, Any]] = []
+        segments: list[dict[str, Any]] = []
         for event in payload.get("events", []) or []:
             parts = event.get("segs") or []
             if not parts:
                 continue
             cue_text = html.unescape("".join(str(part.get("utf8", "")) for part in parts)).replace("\n", " ").strip()
-            if not cue_text:
-                continue
-            segments.append({"start": float(event.get("tStartMs", 0) or 0) / 1000.0, "text": cue_text})
+            if cue_text:
+                segments.append({"start": float(event.get("tStartMs", 0) or 0) / 1000.0, "text": cue_text})
         return segments
 
-    def _read_subtitle_segments(self, path: Path) -> List[Dict[str, Any]]:
+    def _read_subtitle_segments(self, path: Path) -> list[dict[str, Any]]:
+        """Load subtitle cues from either json3 or vtt files."""
+
         text = path.read_text(encoding="utf-8")
-        suffix = path.suffix.lower()
-        if suffix == ".json3":
+        if path.suffix.lower() == ".json3":
             return self._parse_json3_segments(text)
-        if suffix == ".vtt":
+        if path.suffix.lower() == ".vtt":
             return self._parse_vtt_segments(text)
         raise RuntimeError(f"Unsupported subtitle format: {path.name}")
 
-    def _fetch_transcript_with_ytdlp(self, video: YouTubeVideo) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    def _yt_dlp_cookie_sources(self) -> list[tuple[str, dict[str, Any]]]:
+        """Return the ordered yt-dlp cookie strategies to try."""
+
+        sources: list[tuple[str, dict[str, Any]]] = [("yt-dlp", {})]
+        cookie_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
+        if cookie_file:
+            sources.append(("yt-dlp + cookie file", {"cookiefile": cookie_file}))
+        browsers_raw = str(os.environ.get("YOUTUBE_COOKIES_BROWSER", "")).strip()
+        for browser in [value.strip().lower() for value in browsers_raw.split(",") if value.strip()]:
+            sources.append((f"yt-dlp + {COOKIE_BROWSER_LABELS.get(browser, browser.title())} cookies", {"cookiesfrombrowser": (browser, None, None, None)}))
+        return sources
+
+    class _QuietYTDLPLogger:
+        """Suppress yt-dlp log spam inside the UI request cycle."""
+
+        def debug(self, msg: str) -> None:
+            return None
+
+        def warning(self, msg: str) -> None:
+            return None
+
+        def error(self, msg: str) -> None:
+            return None
+
+    def _fetch_transcript_with_ytdlp(self, video: YouTubeVideo) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+        """Use yt-dlp subtitle download as the last transcript fallback."""
+
         try:
-            from yt_dlp import DownloadError, YoutubeDL
+            from yt_dlp import YoutubeDL
         except Exception as exc:
             return None, f"yt-dlp fallback unavailable: {type(exc).__name__}: {exc}"
 
@@ -918,347 +734,225 @@ class TubeMindApp:
                         "subtitlesformat": "json3/vtt/best",
                         "outtmpl": {"default": outtmpl, "subtitle": outtmpl},
                     } | extra_opts
-
                     with YoutubeDL(opts) as ydl:
                         ydl.download([video.url])
-
                     subtitle_files = sorted(Path(tmpdir).glob(f"{video.video_id}*.json3"))
                     subtitle_files.extend(sorted(Path(tmpdir).glob(f"{video.video_id}*.vtt")))
                     if not subtitle_files:
                         last_err = f"{source_label} did not produce a subtitle file"
                         continue
-
                     segments = self._read_subtitle_segments(subtitle_files[0])
                     if segments:
                         return segments, None
                     last_err = f"{source_label} produced an empty subtitle file"
             except Exception as exc:
-                label = source_label
-                if extra_opts.get("cookiesfrombrowser"):
-                    browser = extra_opts["cookiesfrombrowser"][0]
-                    label = f"{source_label} ({COOKIE_BROWSER_LABELS.get(browser, browser.title())})"
-                if isinstance(exc, DownloadError):
-                    last_err = f"{label}: {exc}"
-                else:
-                    last_err = f"{label}: {type(exc).__name__}: {exc}"
-
+                last_err = f"{source_label}: {type(exc).__name__}: {exc}"
         return None, last_err
 
-    def _fetch_transcript(self, video: YouTubeVideo) -> tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-        """Fetch transcript segments, preferring TranscriptAPI when configured."""
+    def _fetch_transcript(self, video: YouTubeVideo) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+        """Fetch transcript segments with layered provider fallbacks."""
 
         last_err: Optional[str] = None
         transcript_api_err: Optional[str] = None
         yt_dlp_err: Optional[str] = None
         prefer_transcriptapi = bool(self._transcript_api_key())
-
         if prefer_transcriptapi:
-            transcript_api_segments, transcript_api_err = self._fetch_transcript_with_transcriptapi(video)
-            if transcript_api_segments:
-                return transcript_api_segments, None
-            if transcript_api_err:
-                last_err = transcript_api_err
+            segments, transcript_api_err = self._fetch_transcript_with_transcriptapi(video)
+            if segments:
+                return segments, None
+            last_err = transcript_api_err
 
         request_kwargs = self._transcript_request_kwargs()
-
         for attempt in range(1, TRANSCRIPT_RETRY_ATTEMPTS + 1):
             try:
                 try:
                     segments = YouTubeTranscriptApi.get_transcript(video.video_id, languages=("en",), **request_kwargs)
                 except NoTranscriptFound:
                     segments = YouTubeTranscriptApi.get_transcript(video.video_id, **request_kwargs)
-
-                if not segments:
-                    last_err = "empty transcript payload"
-                else:
+                if segments:
                     return segments, None
+                last_err = "empty transcript payload"
             except Exception as exc:
                 last_err = self._describe_transcript_error(exc, using_cookies=bool(request_kwargs.get("cookies")))
                 if not self._should_retry_transcript_error(exc):
                     break
-
             if attempt < TRANSCRIPT_RETRY_ATTEMPTS:
                 time.sleep(TRANSCRIPT_RETRY_BASE_DELAY * (2 ** (attempt - 1)))
 
         if not prefer_transcriptapi:
-            transcript_api_segments, transcript_api_err = self._fetch_transcript_with_transcriptapi(video)
-            if transcript_api_segments:
-                return transcript_api_segments, None
+            segments, transcript_api_err = self._fetch_transcript_with_transcriptapi(video)
+            if segments:
+                return segments, None
 
-        yt_dlp_segments, yt_dlp_err = self._fetch_transcript_with_ytdlp(video)
-        if yt_dlp_segments:
-            return yt_dlp_segments, None
+        segments, yt_dlp_err = self._fetch_transcript_with_ytdlp(video)
+        if segments:
+            return segments, None
+        errors = [err for err in (last_err, transcript_api_err, yt_dlp_err) if err]
+        return None, "\n".join(errors) if errors else "unknown transcript error"
 
-        error_chain: List[str] = []
-        for err in (last_err, transcript_api_err, yt_dlp_err):
-            if err and err not in error_chain:
-                error_chain.append(err)
-        if error_chain:
-            last_err = "\n".join(error_chain)
+    def _youtube_video_id_from_doc_id(self, doc_id: str) -> str:
+        """Extract the YouTube id from a LightRAG document id."""
 
-        return None, last_err or "unknown transcript error"
+        return doc_id.split(":", 1)[1].strip() if doc_id.startswith("youtube:") else ""
 
-    def start_youtube_index_job(
-        self,
-        query: str,
-        *,
-        max_videos: int,
-        min_seconds: int,
-        order: str,
-        preferred_channels_raw: str = "",
-        excluded_channels_raw: str = "",
-        preferred_only: bool = False,
-        selected_video_ids: Optional[List[str]] = None,
-    ) -> str:
-        """Start the background indexing workflow for a new YouTube corpus topic."""
+    def _extract_title_from_summary(self, summary: str) -> str:
+        """Recover the transcript title from a LightRAG status summary."""
 
-        normalized = query.strip()
-        if not normalized:
-            raise ValueError("Enter a YouTube search phrase to index.")
+        match = re.search(r"(?m)^Title:\s*(.+)$", summary or "")
+        return match.group(1).strip() if match else ""
 
-        preferred_channels = self._parse_channel_filters(preferred_channels_raw)
-        excluded_channels = self._parse_channel_filters(excluded_channels_raw)
-        selected_ids = [str(video_id).strip() for video_id in (selected_video_ids or []) if str(video_id).strip()]
+    def _doc_item_key(self, doc_id: str, item: dict[str, str]) -> str:
+        """Build a stable key for deduplicating document status rows."""
 
-        with self.lock:
-            self._store_channel_filters(preferred_channels, excluded_channels, preferred_only)
-            self.reset_youtube_index(preserve_filters=True)
+        return str(item.get("videoId") or item.get("url") or item.get("title") or doc_id)
 
-            job_id = f"job_{now_ms()}"
-            self.state.job_id = job_id
-            self.state.youtube_seed_query = normalized
-            self._set_job(active=True, stage="search", progress=0, total=max_videos, msg="Searching YouTube...")
+    def _is_already_processed_duplicate(self, status_doc: Any) -> bool:
+        """Detect LightRAG duplicate-insert errors for already processed docs."""
 
-            def runner():
-                try:
-                    asyncio.run(self._run_youtube_index_job(job_id, normalized, max_videos, min_seconds, order, selected_ids))
-                except Exception as exc:
-                    with self.lock:
-                        self.state.youtube_indexed = False
-                        self.state.youtube_video_ids = []
-                        self.state.youtube_titles = []
-                        self.state.youtube_urls = {}
-                        self._set_job(active=False, stage="error", progress=0, total=0, msg=str(exc))
+        error_msg = str(getattr(status_doc, "error_msg", "") or "").lower()
+        return "content already exists." in error_msg and "status: processed" in error_msg
 
-            self._bg_thread = threading.Thread(target=runner, daemon=True)
-            self._bg_thread.start()
-            return job_id
+    def _classify_doc_status_docs(self, docs: dict[str, Any], video_lookup: Optional[dict[str, YouTubeVideo]] = None) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Split LightRAG status rows into successful and failed documents."""
 
-    async def _run_youtube_index_job(
-        self,
-        job_id: str,
-        query: str,
-        max_videos: int,
-        min_seconds: int,
-        order: str,
-        selected_video_ids: Optional[List[str]] = None,
-    ) -> None:
-        selected_set = {str(video_id).strip() for video_id in (selected_video_ids or []) if str(video_id).strip()}
-        candidate_pool = self._transcript_candidate_pool(max_videos)
-        if selected_set:
-            candidate_pool = max(candidate_pool, 20)
-        with self.lock:
-            preferred_channels = list(self.state.youtube_preferred_channels)
-            excluded_channels = list(self.state.youtube_excluded_channels)
-            preferred_only = self.state.youtube_preferred_only
+        from lightrag.base import DocStatus
 
-        videos = await self.youtube_search(
-            query,
-            max_videos=candidate_pool,
-            min_seconds=min_seconds,
-            order=order,
-            preferred_channels=preferred_channels,
-            excluded_channels=excluded_channels,
-            preferred_only=preferred_only,
-        )
-        if selected_set:
-            videos = [video for video in videos if video.video_id in selected_set]
+        successful_map: dict[str, dict[str, str]] = {}
+        failed_map: dict[str, dict[str, str]] = {}
+        video_lookup = video_lookup or {}
+        video_lookup_by_url = {video.url: video for video in video_lookup.values()}
+        for doc_id, status_doc in docs.items():
+            video_id = self._youtube_video_id_from_doc_id(doc_id)
+            file_path = str(getattr(status_doc, "file_path", "") or "")
+            video = video_lookup.get(video_id) or video_lookup_by_url.get(file_path)
+            if video and not video_id:
+                video_id = video.video_id
+            title = video.title if video else self._extract_title_from_summary(str(getattr(status_doc, "content_summary", "") or ""))
+            title = title or file_path or doc_id
+            item = {
+                "videoId": video_id,
+                "title": title,
+                "url": file_path or (video.url if video else yt_watch_url(video_id) if video_id else ""),
+                "thumbnail": video.thumbnail if video else "",
+            }
+            key = self._doc_item_key(doc_id, item)
+            status = getattr(status_doc, "status", None)
+            if status == DocStatus.PROCESSED or self._is_already_processed_duplicate(status_doc):
+                failed_map.pop(key, None)
+                successful_map.setdefault(key, item)
+            elif status == DocStatus.FAILED and key not in successful_map:
+                failed_map.setdefault(key, {**item, "reason": f"Indexing failed: {str(getattr(status_doc, 'error_msg', '') or 'unknown error')}"})
+        return list(successful_map.values()), list(failed_map.values())
 
-        with self.lock:
-            if self.state.job_id != job_id:
-                return
-            self._save_recommendations(videos)
-            if not videos:
-                filter_hint = ""
-                if selected_set:
-                    filter_hint = " Preview the candidate list again and reselect the videos you want to include."
-                elif preferred_channels or excluded_channels or self.state.youtube_global_excluded_channels:
-                    filter_hint = " Try loosening the channel filters, changing your saved blacklist, or searching a broader topic."
-                self._set_job(
-                    active=False,
-                    stage="error",
-                    progress=0,
-                    total=0,
-                    msg=f"No transcript-eligible videos matched the current search.{filter_hint}",
-                )
-                return
-            self._set_job(
-                active=True,
-                stage="transcripts",
-                progress=0,
-                total=len(videos),
-                msg=f"Fetching transcripts from {len(videos)} candidate videos...",
+    async def _get_docs_by_track_id(self, runtime: BoardRuntime, track_id: str) -> dict[str, Any]:
+        """Read LightRAG document status rows for one insertion batch."""
+
+        return await self._run_coro_on_rag_loop(runtime.rag.doc_status.get_docs_by_track_id(track_id))
+
+    async def _expand_board_corpus(self, board_id: int, runtime: BoardRuntime, queries: list[dict[str, str]]) -> None:
+        """Search, fetch, and index additional videos into one board corpus."""
+
+        existing_ids = {str(item.get("video_id", "") or "").strip() for item in list_board_videos(board_id)}
+        queued_ids = set(existing_ids)
+        documents: list[str] = []
+        ids: list[str] = []
+        file_paths: list[str] = []
+        indexed_videos: list[YouTubeVideo] = []
+        origin_query_by_video_id: dict[str, str] = {}
+
+        for item in queries[:3]:
+            query_text = str(item.get("query", "") or "").strip()
+            if not query_text:
+                continue
+            videos = await self.youtube_search(
+                query_text,
+                max_videos=self._transcript_candidate_pool(MAX_VIDEOS_DEFAULT),
+                min_seconds=MIN_SECONDS_DEFAULT,
+                order="relevance",
             )
-
-        documents: List[str] = []
-        ids: List[str] = []
-        file_paths: List[str] = []
-        indexed_videos: List[YouTubeVideo] = []
-        rate_limited_skips = 0
-
-        for index, video in enumerate(videos, start=1):
-            if len(documents) >= max_videos:
+            for video in videos:
+                if video.video_id in queued_ids:
+                    continue
+                queued_ids.add(video.video_id)
+                segments, _ = self._fetch_transcript(video)
+                if not segments:
+                    time.sleep(self._transcript_request_delay())
+                    continue
+                transcript = self._save_transcript_artifact(runtime, video, segments)
+                if not transcript.strip():
+                    time.sleep(self._transcript_request_delay())
+                    continue
+                documents.append(transcript)
+                ids.append(f"youtube:{video.video_id}")
+                file_paths.append(video.url)
+                indexed_videos.append(video)
+                origin_query_by_video_id[video.video_id] = query_text
+                time.sleep(self._transcript_request_delay())
+                if len(documents) >= MAX_VIDEOS_DEFAULT:
+                    break
+            if len(documents) >= MAX_VIDEOS_DEFAULT:
                 break
 
-            with self.lock:
-                if self.state.job_id != job_id:
-                    return
-                self._set_job(
-                    active=True,
-                    stage="transcripts",
-                    progress=index - 1,
-                    total=len(videos),
-                    msg=f"Transcript {index} of {len(videos)}",
-                )
+        if not documents:
+            return
 
-            segments, err = self._fetch_transcript(video)
-            if not segments:
-                if err and self._looks_rate_limited(err):
-                    rate_limited_skips += 1
-                with self.lock:
-                    self.state.youtube_skipped.append(
-                        {
-                            "videoId": video.video_id,
-                            "title": video.title,
-                            "thumbnail": video.thumbnail,
-                            "url": video.url,
-                            "reason": err or "unknown",
-                        }
-                    )
-                    self._publish_dashboard_state()
-                time.sleep(self._transcript_request_delay())
-                continue
+        track_id = await self._run_coro_on_rag_loop(runtime.rag.ainsert(documents, ids=ids, file_paths=file_paths))
+        docs = await self._get_docs_by_track_id(runtime, track_id)
+        successful, _ = self._classify_doc_status_docs(docs, {video.video_id: video for video in indexed_videos})
+        if not successful:
+            return
 
-            transcript = self._save_transcript_artifact(video, segments)
-            if not transcript.strip():
-                with self.lock:
-                    self.state.youtube_skipped.append(
-                        {
-                            "videoId": video.video_id,
-                            "title": video.title,
-                            "thumbnail": video.thumbnail,
-                            "url": video.url,
-                            "reason": "empty transcript",
-                        }
-                    )
-                    self._publish_dashboard_state()
-                continue
-
-            document = transcript
-
-            documents.append(document)
-            ids.append(f"youtube:{video.video_id}")
-            file_paths.append(video.url)
-            indexed_videos.append(video)
-
-            time.sleep(self._transcript_request_delay())
-
-        with self.lock:
-            self._set_job(active=True, stage="index", progress=0, total=len(documents), msg="Indexing into LightRAG...")
-
-        successful_videos: List[Dict[str, str]] = [
-            {
-                "videoId": video.video_id,
-                "title": video.title,
-                "url": video.url,
-                "thumbnail": video.thumbnail,
-            }
-            for video in indexed_videos
-        ]
-        processing_failures: List[Dict[str, str]] = []
-
-        if documents:
-            track_id = await self._run_coro_on_rag_loop(self.rag.ainsert(documents, ids=ids, file_paths=file_paths))
-            track_docs = await self._get_docs_by_track_id(track_id)
-            successful_videos, processing_failures = self._classify_doc_status_docs(
-                track_docs,
-                {video.video_id: video for video in indexed_videos},
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in successful:
+            video_id = str(item.get("videoId", "") or "")
+            grouped.setdefault(origin_query_by_video_id.get(video_id, ""), []).append(
+                {
+                    "video_id": video_id,
+                    "title": str(item.get("title", "") or ""),
+                    "url": str(item.get("url", "") or ""),
+                    "thumbnail": str(item.get("thumbnail", "") or ""),
+                    "channel_title": next((video.channel_title for video in indexed_videos if video.video_id == video_id), ""),
+                }
             )
+        for origin_query, videos in grouped.items():
+            upsert_board_videos(board_id, videos, origin_query=origin_query)
 
-        with self.lock:
-            self.state.youtube_skipped = self._merge_skipped_items(self.state.youtube_skipped, processing_failures)
-            indexed_count = len(successful_videos)
-            self.state.youtube_indexed = indexed_count > 0
-            self.state.youtube_video_ids = [video["videoId"] for video in successful_videos if video.get("videoId")]
-            self.state.youtube_titles = [video["title"] for video in successful_videos]
-            self.state.youtube_urls = {
-                video["title"]: video["url"]
-                for video in successful_videos
-                if video.get("title") and video.get("url")
-            }
-            done_msg = f"Indexed {indexed_count} videos."
-            if indexed_count == 0:
-                if processing_failures:
-                    done_msg = "Transcripts were fetched, but building the corpus failed. Check skipped videos for the exact OpenAI or indexing error."
-                elif rate_limited_skips or any(self._looks_rate_limited(str(item.get("reason", ""))) for item in self.state.youtube_skipped):
-                    done_msg += " YouTube rate-limited transcript access for this IP. TubeMind kept trying the candidate pool, but none succeeded. Try fewer videos, add TranscriptAPI/cookies, or widen the topic."
-                elif preferred_channels or excluded_channels:
-                    done_msg += " The active channel filters may have removed the videos most likely to expose transcripts."
-                else:
-                    done_msg += " (Most likely transcripts were disabled. Check skipped list.)"
-            final_stage = "done" if indexed_count > 0 else "error"
-            self._set_job(active=False, stage=final_stage, progress=indexed_count, total=indexed_count, msg=done_msg)
+    async def _query_board(self, board_id: int, runtime: BoardRuntime, question: str, mode: str, *, allow_empty: bool) -> dict[str, Any]:
+        """Run a board-scoped LightRAG query and normalize the answer payload."""
 
-    async def query_youtube(self, question: str, mode: str = DEFAULT_QUERY_MODE) -> Dict[str, Any]:
-        """Return a synthesized answer plus the supporting transcript chunks."""
-
-        question_text = question.strip()
-        if not question_text:
-            raise ValueError("Enter a question.")
-        if not self.state.youtube_indexed:
-            if self.state.job_active:
-                raise ValueError("Indexing is still running. Wait until the dashboard says the corpus is ready, then ask again.")
-            if self.state.youtube_seed_query:
-                raise ValueError("No videos were successfully indexed for the current topic yet. Check skipped videos, relax the channel filters if needed, then start indexing again.")
-            raise ValueError("Index YouTube first. Start with a topic, let TubeMind finish indexing, then ask your question.")
-        if mode not in QUERY_MODES:
-            mode = DEFAULT_QUERY_MODE
+        board_videos = list_board_videos(board_id)
+        if not board_videos:
+            return {"question": question, "mode": mode, "answer": "", "chunks": []}
 
         from lightrag import QueryParam
 
-        answer = str(
-            await self._run_coro_on_rag_loop(
-                self.rag.aquery(
-                    question_text,
-                    param=QueryParam(mode=mode, response_type="Multiple Paragraphs"),
-                )
-            )
-        ).strip()
+        try:
+            answer = str(await self._run_coro_on_rag_loop(runtime.rag.aquery(question, param=QueryParam(mode=mode, response_type="Multiple Paragraphs")))).strip()
+            data = await self._run_coro_on_rag_loop(runtime.rag.aquery_data(question, param=QueryParam(mode=mode)))
+        except Exception:
+            if allow_empty:
+                return {"question": question, "mode": mode, "answer": "", "chunks": []}
+            raise
 
-        result = await self._run_coro_on_rag_loop(
-            self.rag.aquery_data(
-                question_text,
-                param=QueryParam(mode=mode),
-            )
-        )
-        chunks = list((result or {}).get("data", {}).get("chunks", []) or [])
-
+        chunks = list((data or {}).get("data", {}).get("chunks", []) or [])
         if not chunks and ((not answer) or answer.lower() in {"none", "null"}):
-            raise RuntimeError("No transcript chunks matched that question. Try a simpler question or re-index different videos.")
+            if allow_empty:
+                return {"question": question, "mode": mode, "answer": "", "chunks": []}
+            raise RuntimeError("No transcript chunks matched that note yet.")
 
-        title_by_url = {url: title for title, url in self.state.youtube_urls.items()}
-        cleaned_chunks: List[Dict[str, str]] = []
+        title_by_url = {str(item.get("url", "") or ""): str(item.get("title", "") or "Indexed transcript") for item in board_videos}
+        normalized_chunks: list[dict[str, Any]] = []
         for chunk in chunks:
-            file_path = str(chunk.get("file_path") or "").strip()
+            file_path = str(chunk.get("file_path", "") or "").strip()
             video_id = self._video_id_from_url(file_path)
-            start_seconds = self._find_chunk_start_seconds(video_id, str(chunk.get("content") or ""))
-            cleaned_chunks.append(
+            start_seconds = self._find_chunk_start_seconds(runtime, video_id, str(chunk.get("content", "") or ""))
+            normalized_chunks.append(
                 {
                     "title": title_by_url.get(file_path, file_path or "Indexed transcript"),
                     "url": file_path,
-                    "content": str(chunk.get("content") or "").strip(),
-                    "reference_id": str(chunk.get("reference_id") or "").strip(),
-                    "chunk_id": str(chunk.get("chunk_id") or "").strip(),
+                    "content": str(chunk.get("content", "") or "").strip(),
+                    "reference_id": str(chunk.get("reference_id", "") or "").strip(),
+                    "chunk_id": str(chunk.get("chunk_id", "") or "").strip(),
                     "video_id": video_id,
                     "start_seconds": start_seconds,
                     "embed_url": self._youtube_embed_url(video_id, start_seconds) if video_id else "",
@@ -1266,53 +960,15 @@ class TubeMindApp:
                     "start_label": seconds_to_label(int(start_seconds)),
                 }
             )
-
-        return {
-            "question": question_text,
-            "mode": mode,
-            "answer": answer,
-            "chunks": cleaned_chunks,
-        }
-
-    def status_payload(self) -> Dict[str, Any]:
-        """Return the normalized dashboard payload consumed by the UI and APIs."""
-
-        state = self.state
-        indexed_titles = state.youtube_titles if state.youtube_indexed else []
-        indexed_urls = state.youtube_urls if state.youtube_indexed else {}
-        return {
-            "youtube": {
-                "indexed": state.youtube_indexed,
-                "seed_query": state.youtube_seed_query,
-                "filters": {
-                    "preferred_channels": state.youtube_preferred_channels,
-                    "excluded_channels": state.youtube_excluded_channels,
-                    "global_excluded_channels": state.youtube_global_excluded_channels,
-                    "preferred_only": state.youtube_preferred_only,
-                },
-                "count": len(indexed_titles),
-                "titles": indexed_titles,
-                "urls": indexed_urls,
-                "recommendations": state.youtube_recommendations,
-            },
-            "job": {
-                "active": state.job_active,
-                "id": state.job_id,
-                "stage": state.job_stage,
-                "progress": state.job_progress,
-                "total": state.job_total,
-                "message": state.job_message,
-            },
-            "skipped": state.youtube_skipped[-30:],
-        }
+        return {"question": question, "mode": mode, "answer": answer, "chunks": normalized_chunks}
 
 
-_user_apps: Dict[str, TubeMindApp] = {}
-_user_locks: Dict[str, asyncio.Lock] = {}
+_user_apps: dict[str, TubeMindApp] = {}
+_user_locks: dict[str, asyncio.Lock] = {}
 
 
 async def get_user_app(user_id: str) -> TubeMindApp:
-    """Return the singleton TubeMind runtime for one authenticated user."""
+    """Return the singleton runtime for one authenticated user."""
 
     if user_id in _user_apps:
         return _user_apps[user_id]

@@ -8,7 +8,7 @@ from typing import Any, Optional
 from fasthtml.common import A, Button, Div, Form, H1, H2, H3, Iframe, Img, Input, Label, Option, P, Pre, Select, Span, Textarea, Title
 
 from tubemind.auth import ERROR_MESSAGES, begin_oauth_session, google_auth_url, list_note_chunks, list_note_queries
-from tubemind.config import DEFAULT_QUERY_MODE, QUERY_MODE_LABELS
+from tubemind.config import DEFAULT_QUERY_MODE, DEMO_AUTH_ENABLED, GOOGLE_AUTH_ENABLED, QUERY_MODE_LABELS
 from tubemind.models import BoardWorkspace
 
 
@@ -42,16 +42,32 @@ def render_user_badge(user: dict[str, Any]) -> Any:
 
 
 def render_login_page(session, error: str = "") -> Any:
-    """Render the Google sign-in page for unauthenticated visitors."""
+    """Render the configured sign-in options for unauthenticated visitors."""
 
-    state = begin_oauth_session(session)
     error_msg = ERROR_MESSAGES.get(error, "")
+    actions: list[Any] = []
+
+    if GOOGLE_AUTH_ENABLED:
+        state = begin_oauth_session(session)
+        actions.append(A("Sign in with Google", href=google_auth_url(state), role="button", cls="signin-btn"))
+    if DEMO_AUTH_ENABLED:
+        actions.append(A("Enter Demo Workspace", href="/auth/demo", role="button", cls="signin-btn"))
+
+    login_copy = "Sign in to create topic-bound research boards from YouTube videos."
+    if DEMO_AUTH_ENABLED and not GOOGLE_AUTH_ENABLED:
+        login_copy = "Demo mode is enabled for this deployment. Enter the workspace to start your coursework demo."
+    elif DEMO_AUTH_ENABLED and GOOGLE_AUTH_ENABLED:
+        login_copy = "Use Google sign-in or enter the demo workspace for a lightweight coursework deploy."
+
     return Title("TubeMind - Sign in"), Div(
         Div(
             H2("TubeMind", cls="login-title"),
-            P("Sign in with Google to create topic-bound research boards from YouTube videos.", cls="login-copy"),
+            P(login_copy, cls="login-copy"),
             Div(error_msg, cls="login-error") if error_msg else "",
-            A("Sign in with Google", href=google_auth_url(state), role="button", cls="signin-btn"),
+            Div(*actions, cls="login-actions") if actions else P(
+                "No login method is configured. Set DEMO_AUTH_ENABLED=true for a coursework deploy or configure Google OAuth.",
+                cls="login-copy",
+            ),
             cls="login-card",
         ),
         cls="login-shell",

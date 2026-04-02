@@ -6,6 +6,7 @@ from fasthtml.common import FileResponse, JSONResponse, Link, RedirectResponse, 
 
 from tubemind.auth import (
     current_user,
+    ensure_demo_user_session,
     get_board_for_user,
     get_note_for_user,
     google_exchange_code,
@@ -15,7 +16,7 @@ from tubemind.auth import (
     set_active_board,
     upsert_user_profile,
 )
-from tubemind.config import CSS_FILE, HTMX_SSE_EXTENSION_URL, SESSION_SECRET
+from tubemind.config import CSS_FILE, DEMO_AUTH_ENABLED, GOOGLE_AUTH_ENABLED, HTMX_SSE_EXTENSION_URL, SESSION_SECRET
 from tubemind.services import get_user_app, shutdown_all_user_apps
 from tubemind.ui import render_login_page, render_note_detail_page, render_sidebar, render_workspace
 
@@ -44,11 +45,25 @@ def create_app():
         on_shutdown=[shutdown_all_user_apps],
     )
 
+    def authenticated_user(session):
+        """Resolve the session user, optionally provisioning the demo account."""
+
+        user = current_user(session)
+        if user:
+            return user
+        return ensure_demo_user_session(session)
+
     @rt("/static/tubemind.css")
     def get_tubemind_css():
         """Serve the standalone TubeMind stylesheet from disk."""
 
         return FileResponse(CSS_FILE, media_type="text/css")
+
+    @rt("/health")
+    def get_health():
+        """Expose an unauthenticated health endpoint for deployment checks."""
+
+        return JSONResponse({"ok": True})
 
     @rt("/login")
     def get_login(session, error: str = ""):
@@ -59,10 +74,21 @@ def create_app():
             return RedirectResponse("/", status_code=303)
         return render_login_page(session, error=error)
 
+    @rt("/auth/demo")
+    def get_demo_auth(session):
+        """Create the demo user session when demo auth is enabled."""
+
+        if not DEMO_AUTH_ENABLED:
+            return RedirectResponse("/login", status_code=303)
+        ensure_demo_user_session(session)
+        return RedirectResponse("/", status_code=303)
+
     @rt("/auth/callback")
     def get_auth_callback(request: Request, session, code: str = "", state: str = ""):
         """Complete the Google OAuth flow and create/update the local user row."""
 
+        if not GOOGLE_AUTH_ENABLED:
+            return RedirectResponse("/login", status_code=303)
         if not code:
             return RedirectResponse("/login?error=no_code", status_code=303)
         if not state or state != session.get("oauth_state"):
@@ -90,7 +116,7 @@ def create_app():
     async def get_root(request: Request, session):
         """Render the board workspace using the user's persisted active board."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return RedirectResponse("/login", status_code=303)
         app_state = await get_user_app(user["id"])
@@ -101,7 +127,7 @@ def create_app():
     async def get_board(request: Request, session, board_id: int):
         """Switch the active board and render the workspace for that board."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return RedirectResponse("/login", status_code=303)
         board = get_board_for_user(user["id"], board_id)
@@ -116,7 +142,7 @@ def create_app():
     async def get_note(request: Request, session, note_id: int):
         """Render the dedicated note detail page for one persisted note."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return RedirectResponse("/login", status_code=303)
         note = get_note_for_user(user["id"], note_id)
@@ -128,7 +154,7 @@ def create_app():
     async def api_create_board(request: Request, session):
         """Create an empty board and refresh the workspace shell."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return RedirectResponse("/login", status_code=303)
         app_state = await get_user_app(user["id"])
@@ -139,7 +165,7 @@ def create_app():
     async def api_add_question(request: Request, session):
         """Answer a question inside the selected board and refresh the workspace."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return RedirectResponse("/login", status_code=303)
         form = await request.form()
@@ -159,7 +185,7 @@ def create_app():
     async def api_sidebar(request: Request, session):
         """Return the current board sidebar fragment for HTMX refreshes."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return JSONResponse({"error": "not authenticated"}, status_code=401)
         return render_sidebar(list_boards(user["id"]), int(user.get("active_board_id") or 0) or None)
@@ -168,7 +194,7 @@ def create_app():
     async def api_status(request: Request, session):
         """Expose a lightweight JSON view of the current board workspace."""
 
-        user = current_user(session)
+        user = authenticated_user(session)
         if not user:
             return JSONResponse({"error": "not authenticated"}, status_code=401)
         app_state = await get_user_app(user["id"])

@@ -88,6 +88,11 @@ h1, h2, h3 { font-family: "Space Grotesk", sans-serif; letter-spacing: -0.03em; 
     font-weight: 700;
 }
 
+.login-actions {
+    display: grid;
+    gap: 12px;
+}
+
 .sidebar-board-list { display: grid; gap: 10px; }
 .sidebar-board-link { text-decoration: none; color: inherit; }
 .sidebar-board {

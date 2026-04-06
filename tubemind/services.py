@@ -610,6 +610,28 @@ class TubeMindApp:
             "On hosted deployments this usually means TranscriptAPI auth is invalid, quota is exhausted, or the candidate videos do not have captions."
         )
 
+    def _summarize_indexing_failures(self, failures: list[dict[str, str]]) -> str:
+        """Compress document indexing failures into a readable warning."""
+
+        previews: list[str] = []
+        seen: set[str] = set()
+        for failure in failures:
+            title = str(failure.get("title", "") or "Indexed transcript").strip()
+            reason = str(failure.get("reason", "") or "unknown indexing error").strip()
+            line = f"{title}: {reason}"
+            if line in seen:
+                continue
+            seen.add(line)
+            previews.append(line)
+
+        if not previews:
+            return "TubeMind fetched transcripts, but indexing them into the board failed before any evidence became available."
+
+        return (
+            "TubeMind fetched transcripts, but indexing them into the board failed before any evidence became available.\n\n"
+            f"{chr(10).join(previews[:3])}"
+        )
+
     def _is_transcript_rate_limited(self, exc: Exception) -> bool:
         """Detect transcript rate-limit conditions across providers."""
 
@@ -933,6 +955,9 @@ class TubeMindApp:
                 min_seconds=MIN_SECONDS_DEFAULT,
                 order="relevance",
             )
+            if not videos:
+                transcript_failures.append(f'No caption-friendly YouTube results were found for query "{query_text}".')
+                continue
             for video in videos:
                 if video.video_id in queued_ids:
                     continue
@@ -965,8 +990,10 @@ class TubeMindApp:
 
         track_id = await self._run_coro_on_rag_loop(runtime.rag.ainsert(documents, ids=ids, file_paths=file_paths))
         docs = await self._get_docs_by_track_id(runtime, track_id)
-        successful, _ = self._classify_doc_status_docs(docs, {video.video_id: video for video in indexed_videos})
+        successful, failed = self._classify_doc_status_docs(docs, {video.video_id: video for video in indexed_videos})
         if not successful:
+            if failed:
+                raise RuntimeError(self._summarize_indexing_failures(failed))
             return
 
         grouped: dict[str, list[dict[str, Any]]] = {}

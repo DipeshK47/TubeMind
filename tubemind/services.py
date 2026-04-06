@@ -654,12 +654,16 @@ class TubeMindApp:
         if not api_key:
             return None, None
         headers = {"Authorization": f"Bearer {api_key}"}
-        params = {"platform": "youtube", "video_id": video.video_id}
+        params = {
+            "video_url": video.video_id,
+            "format": "json",
+            "include_timestamp": "true",
+        }
         last_err = "unknown TranscriptAPI error"
         retry_delay = 1.0
         with httpx.Client(timeout=30.0) as client:
             for _ in range(3):
-                response = client.get(f"{TRANSCRIPTAPI_BASE_URL}/transcripts", params=params, headers=headers)
+                response = client.get(f"{TRANSCRIPTAPI_BASE_URL}/youtube/transcript", params=params, headers=headers)
                 if response.status_code == 200:
                     payload = response.json()
                     cues = payload.get("transcript", []) if isinstance(payload, dict) else []

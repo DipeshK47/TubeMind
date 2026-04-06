@@ -544,13 +544,35 @@ class TubeMindApp:
     def _transcript_request_kwargs(self) -> dict[str, Any]:
         """Return optional cookie-file settings for transcript requests."""
 
-        cookies_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
+        cookies_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip().strip("'").strip('"')
         return {"cookies": cookies_file} if cookies_file else {}
 
     def _transcript_api_key(self) -> str:
         """Return the configured TranscriptAPI key when present."""
 
-        return str(os.environ.get("TRANSCRIPTAPI_API_KEY", "")).strip()
+        return str(os.environ.get("TRANSCRIPTAPI_API_KEY", "")).strip().strip("'").strip('"')
+
+    def _summarize_transcript_failures(self, failures: list[str]) -> str:
+        """Compress repeated transcript fetch failures into a readable warning."""
+
+        seen: set[str] = set()
+        unique_failures: list[str] = []
+        for failure in failures:
+            cleaned = str(failure or "").strip()
+            if not cleaned or cleaned in seen:
+                continue
+            seen.add(cleaned)
+            unique_failures.append(cleaned)
+
+        if not unique_failures:
+            return "TubeMind found videos, but transcript fetching failed before any evidence could be indexed."
+
+        preview = "\n\n".join(unique_failures[:3])
+        return (
+            "TubeMind found videos, but could not fetch any usable transcripts for them.\n\n"
+            f"{preview}\n\n"
+            "On hosted deployments this usually means TranscriptAPI auth is invalid, quota is exhausted, or the candidate videos do not have captions."
+        )
 
     def _is_transcript_rate_limited(self, exc: Exception) -> bool:
         """Detect transcript rate-limit conditions across providers."""
@@ -690,10 +712,10 @@ class TubeMindApp:
         """Return the ordered yt-dlp cookie strategies to try."""
 
         sources: list[tuple[str, dict[str, Any]]] = [("yt-dlp", {})]
-        cookie_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip()
+        cookie_file = str(os.environ.get("YOUTUBE_TRANSCRIPT_COOKIES_FILE", "")).strip().strip("'").strip('"')
         if cookie_file:
             sources.append(("yt-dlp + cookie file", {"cookiefile": cookie_file}))
-        browsers_raw = str(os.environ.get("YOUTUBE_COOKIES_BROWSER", "")).strip()
+        browsers_raw = str(os.environ.get("YOUTUBE_COOKIES_BROWSER", "")).strip().strip("'").strip('"')
         for browser in [value.strip().lower() for value in browsers_raw.split(",") if value.strip()]:
             sources.append((f"yt-dlp + {COOKIE_BROWSER_LABELS.get(browser, browser.title())} cookies", {"cookiesfrombrowser": (browser, None, None, None)}))
         return sources
@@ -859,6 +881,7 @@ class TubeMindApp:
         file_paths: list[str] = []
         indexed_videos: list[YouTubeVideo] = []
         origin_query_by_video_id: dict[str, str] = {}
+        transcript_failures: list[str] = []
 
         for item in queries[:3]:
             query_text = str(item.get("query", "") or "").strip()
@@ -874,12 +897,14 @@ class TubeMindApp:
                 if video.video_id in queued_ids:
                     continue
                 queued_ids.add(video.video_id)
-                segments, _ = self._fetch_transcript(video)
+                segments, transcript_error = self._fetch_transcript(video)
                 if not segments:
+                    transcript_failures.append(f"{video.title}: {transcript_error or 'unknown transcript error'}")
                     time.sleep(self._transcript_request_delay())
                     continue
                 transcript = self._save_transcript_artifact(runtime, video, segments)
                 if not transcript.strip():
+                    transcript_failures.append(f"{video.title}: fetched transcript was empty after normalization")
                     time.sleep(self._transcript_request_delay())
                     continue
                 documents.append(transcript)
@@ -894,6 +919,8 @@ class TubeMindApp:
                 break
 
         if not documents:
+            if transcript_failures:
+                raise RuntimeError(self._summarize_transcript_failures(transcript_failures))
             return
 
         track_id = await self._run_coro_on_rag_loop(runtime.rag.ainsert(documents, ids=ids, file_paths=file_paths))

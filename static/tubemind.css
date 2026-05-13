@@ -30,6 +30,15 @@
 
 * { box-sizing: border-box; }
 
+/* Reset pico's dark code-block styling for pre elements used as text display */
+pre {
+    background: transparent;
+    color: inherit;
+    border: none;
+    padding: 0;
+    font-family: inherit;
+}
+
 html,
 body {
     margin: 0;
@@ -318,6 +327,10 @@ textarea { min-height: 120px; }
     padding: 14px 16px;
     margin: 0;
     white-space: pre-wrap;
+    background: transparent;
+    color: var(--ink);
+    font-family: "Source Sans 3", sans-serif;
+    font-size: 1rem;
 }
 .note-answer-thumbs {
     display: flex;
@@ -332,7 +345,13 @@ textarea { min-height: 120px; }
     height: 72px;
     object-fit: cover;
 }
-.chunk-copy { white-space: pre-wrap; }
+.chunk-copy {
+    white-space: pre-wrap;
+    background: rgba(255,255,255,0.8);
+    color: var(--ink);
+    font-family: "Source Sans 3", sans-serif;
+    font-size: 1rem;
+}
 
 /* ── Markdown-rendered answer ──────────────────────────────── */
 .detail-answer h1,

@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
+import json as _json
+
 from fasthtml.common import A, Button, Details, Div, Form, H1, H2, H3, Iframe, Img, Input, Label, Option, P, Pre, Script, Select, Span, Summary, Textarea, Title
 
 from tubemind.auth import ERROR_MESSAGES, begin_oauth_session, google_auth_url, list_note_chunks, list_note_queries
@@ -118,8 +120,11 @@ def render_board_header(board: Optional[dict[str, Any]]) -> Any:
             P("TubeMind will create a new board automatically from your first question and keep future notes in the same topic region.", cls="board-summary"),
             cls="board-header",
         )
+    status = str(board.get("status", "idle") or "idle").upper()
+    status_msg = str(board.get("status_message", "") or "").strip()
+    kicker_text = f"{status} — {status_msg}" if status == "WORKING" and status_msg else status
     return Div(
-        Span(str(board.get("status", "idle") or "idle").upper(), cls="board-kicker"),
+        Span(kicker_text, cls="board-kicker"),
         H1(str(board.get("title", "") or "Untitled board"), cls="board-title"),
         P(
             str(board.get("summary", "") or "Add notes to this board. After the third note, TubeMind will generate a board summary automatically."),
@@ -129,11 +134,77 @@ def render_board_header(board: Optional[dict[str, Any]]) -> Any:
     )
 
 
-def render_question_form(active_board: Optional[dict[str, Any]]) -> Any:
+def render_question_form(
+    active_board: Optional[dict[str, Any]],
+    channels: list[dict] | None = None,
+    has_notes: bool = False,
+    active_session_id: int | None = None,
+) -> Any:
     """Render the note composer that submits questions into the active board."""
 
-    return Form(
-        Input(type="hidden", name="board_id", value=str(int(active_board.get("id", 0) or 0)) if active_board else ""),
+    board_id_val = str(int(active_board.get("id", 0) or 0)) if active_board else ""
+
+    # Channel filter — standalone dropdown, only when corpus has channels
+    if channels:
+        # Load saved blocked channels for this board to pre-populate checkbox state.
+        saved_blocked: set[str] = set()
+        if active_board:
+            raw = str(active_board.get("blocked_channels") or "")
+            if raw:
+                try:
+                    saved_blocked = {c.casefold() for c in _json.loads(raw) if c}
+                except Exception:
+                    saved_blocked = {c.strip().casefold() for c in raw.split(",") if c.strip()}
+
+        n = len(channels)
+        n_blocked = sum(1 for ch in channels if ch["channel_title"].casefold() in saved_blocked)
+        summary_text = (
+            f"{n} channel{'s' if n != 1 else ''} — {n_blocked} excluded"
+            if n_blocked else
+            f"{n} channel{'s' if n != 1 else ''} — all included"
+        )
+        channel_section = Details(
+            Summary(summary_text, cls="channel-filter-summary search-settings-toggle"),
+            Div(
+                *[
+                    Label(
+                        Input(
+                            type="checkbox",
+                            cls="channel-filter-cb",
+                            value=ch["channel_title"],
+                            checked=(ch["channel_title"].casefold() not in saved_blocked),
+                        ),
+                        Span(ch["channel_title"], cls="channel-filter-name"),
+                        cls="channel-filter-item",
+                    )
+                    for ch in channels
+                ],
+                cls="channel-filter-list",
+            ),
+            P("Uncheck channels to skip their videos when adding new notes.", cls="field-help"),
+            cls="search-settings channel-filter-section",
+        )
+    else:
+        channel_section = ""
+
+    # Regenerate form — only shown when there are notes to refresh
+    if has_notes and channels and active_session_id:
+        regen_form = Form(
+            Input(type="hidden", name="board_id", value=board_id_val),
+            Input(type="hidden", name="session_id", value=str(active_session_id)),
+            Input(type="hidden", name="blocked_channels", value=""),
+            Button("Regenerate notes", type="submit", cls="secondary-btn"),
+            _hx_post=f"/api/boards/{board_id_val}/regenerate",
+            _hx_target="#workspace-root",
+            _hx_swap="outerHTML",
+            id="tm-regen-form",
+        )
+    else:
+        regen_form = ""
+
+    question_form = Form(
+        Input(type="hidden", name="board_id", value=board_id_val),
+        Input(type="hidden", name="session_id", value=str(active_session_id) if active_session_id else ""),
         Div(
             Div(
                 Label("Question", cls="field-label"),
@@ -152,6 +223,7 @@ def render_question_form(active_board: Optional[dict[str, Any]]) -> Any:
             ),
             cls="composer-grid",
         ),
+        channel_section,
         Details(
             Summary("Search settings", cls="search-settings-toggle"),
             Div(
@@ -175,9 +247,9 @@ def render_question_form(active_board: Optional[dict[str, Any]]) -> Any:
             Div(
                 Label("Blocked channels", cls="field-label"),
                 Input(type="text", name="blocked_channels", placeholder="e.g. MrBeast, Shorts Central (comma-separated)"),
-                P("Videos from these channels will be skipped.", cls="field-help"),
+                P("Type channel names to block when no corpus exists yet.", cls="field-help"),
                 cls="field search-settings-grid-full",
-            ),
+            ) if not channels else "",
             cls="search-settings",
         ),
         Div(
@@ -191,6 +263,10 @@ def render_question_form(active_board: Optional[dict[str, Any]]) -> Any:
         id="tm-question-form",
         cls="composer-shell",
     )
+
+    if regen_form:
+        return Div(question_form, regen_form, cls="composer-outer")
+    return question_form
 
 
 def _make_kicker_script(board_id: int) -> Any:
@@ -216,6 +292,11 @@ def _make_kicker_script(board_id: int) -> Any:
                 .then(function (data) {{
                     var msg = progressMsg();
                     if (msg) msg.textContent = data.message || '';
+                    var k = kicker();
+                    if (k && data.status === 'working' && data.message) {{
+                        if (k.dataset.orig == null) k.dataset.orig = k.textContent;
+                        k.textContent = 'WORKING — ' + data.message;
+                    }}
                 }})
                 .catch(function () {{}});
         }}, 1200);
@@ -223,12 +304,20 @@ def _make_kicker_script(board_id: int) -> Any:
 
     function onBefore(e) {{
         var form = e.detail && e.detail.elt;
-        if (!form || form.id !== 'tm-question-form') return;
+        if (!form) return;
+        var isQ = form.id === 'tm-question-form';
+        var isR = form.id === 'tm-regen-form';
+        if (!isQ && !isR) return;
         var k = kicker();
         if (k) {{
             k.dataset.orig = k.textContent;
-            var q = (form.querySelector('[name="question"]') || {{}}).value || '';
-            var label = q.trim() ? 'WORKING — ' + q.trim() : 'WORKING';
+            var label;
+            if (isR) {{
+                label = 'REGENERATING';
+            }} else {{
+                var q = (form.querySelector('[name="question"]') || {{}}).value || '';
+                label = q.trim() ? 'WORKING — ' + q.trim() : 'WORKING';
+            }}
             k.textContent = label;
         }}
         startPolling();
@@ -236,18 +325,48 @@ def _make_kicker_script(board_id: int) -> Any:
 
     function onRestore(e) {{
         var form = e.detail && e.detail.elt;
-        if (!form || form.id !== 'tm-question-form') return;
+        if (!form) return;
+        if (form.id !== 'tm-question-form' && form.id !== 'tm-regen-form') return;
         stopPolling();
         var k = kicker();
         if (k && k.dataset.orig != null) {{ k.textContent = k.dataset.orig; delete k.dataset.orig; }}
     }}
 
+    function onChannelFilter(e) {{
+        var form = e.detail && e.detail.elt;
+        if (!form) return;
+        var isQ = form.id === 'tm-question-form';
+        var isR = form.id === 'tm-regen-form';
+        if (!isQ && !isR) return;
+        // Channel checkboxes live in the question form; read from there for both forms
+        var checkboxes = document.querySelectorAll('.channel-filter-cb');
+        if (!checkboxes.length) return;
+        var blocked = [];
+        checkboxes.forEach(function(cb) {{ if (!cb.checked) blocked.push(cb.value); }});
+        e.detail.parameters['blocked_channels'] = blocked.join(',');
+    }}
+
+    function updateChannelSummary() {{
+        var form = document.getElementById('tm-question-form');
+        if (!form) return;
+        var cbs = form.querySelectorAll('.channel-filter-cb');
+        if (!cbs.length) return;
+        var total = cbs.length, excl = 0;
+        cbs.forEach(function(cb) {{ if (!cb.checked) excl++; }});
+        var s = form.querySelector('.channel-filter-summary');
+        if (s) s.textContent = total + ' channel' + (total !== 1 ? 's' : '') + (excl ? ' — ' + excl + ' excluded' : ' — all included');
+    }}
+
     if (!window.__tmKickerBooted) {{
         window.__tmKickerBooted = true;
         document.addEventListener('htmx:beforeRequest', onBefore);
+        document.addEventListener('htmx:configRequest', onChannelFilter);
         document.addEventListener('htmx:afterSwap',     stopPolling);
         document.addEventListener('htmx:responseError', onRestore);
         document.addEventListener('htmx:sendError',     onRestore);
+        document.addEventListener('change', function(e) {{
+            if (e.target && e.target.classList.contains('channel-filter-cb')) updateChannelSummary();
+        }});
     }}
     // Always refresh board id on each render so the poller targets the right board.
     window.__tmBoardId = BOARD_ID;
@@ -336,7 +455,12 @@ def render_workspace(workspace: BoardWorkspace, user: dict[str, Any]) -> Any:
                 notice_block,
                 warning_block,
                 render_board_header(board),
-                render_question_form(board),
+                render_question_form(
+                    board,
+                    channels=workspace.channels,
+                    has_notes=bool(workspace.notes),
+                    active_session_id=workspace.active_session_id,
+                ),
                 render_note_grid(workspace.notes),
                 cls="board-main",
             ),

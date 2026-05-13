@@ -150,6 +150,14 @@ p, li, span, label, pre, blockquote { color: inherit; }
     font-weight: 700;
 }
 
+.secondary-btn {
+    border: 1px solid var(--line);
+    box-shadow: none;
+    background: rgba(255, 255, 255, 0.82);
+    color: var(--ink);
+    font-weight: 600;
+}
+
 .sidebar-board-list { display: grid; gap: 10px; }
 .sidebar-board-row {
     position: relative;
@@ -235,6 +243,8 @@ p, li, span, label, pre, blockquote { color: inherit; }
     gap: 18px;
 }
 .search-settings { margin-top: 14px; }
+.channel-filter-section { margin-top: 14px; }
+.composer-outer { display: contents; }
 .search-settings-toggle {
     cursor: pointer;
     font-size: 0.85rem;
@@ -256,6 +266,67 @@ details[open] > .search-settings-toggle::before { content: "▾  "; }
 }
 .search-settings-grid-full {
     margin-top: 10px;
+}
+
+/* ── Channel filter checkboxes ─────────────────────────────── */
+.channel-filter-details {
+    margin-top: 8px;
+}
+.channel-filter-summary {
+    margin-bottom: 8px;
+}
+.channel-filter-list {
+    list-style: none;
+    margin: 8px 0 0;
+    padding: 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.channel-filter-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px 5px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--line);
+    background: rgba(255, 255, 255, 0.82);
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.14s ease, border-color 0.14s ease;
+}
+.channel-filter-item:hover {
+    background: rgba(255, 255, 255, 0.98);
+    border-color: rgba(15, 118, 110, 0.3);
+}
+.channel-filter-item input[type="checkbox"] {
+    -webkit-appearance: checkbox;
+    appearance: checkbox;
+    width: 15px;
+    height: 15px;
+    border-radius: 3px !important;
+    border: 1px solid rgba(31, 41, 51, 0.3) !important;
+    background: white !important;
+    box-shadow: none !important;
+    margin: 0;
+    padding: 0;
+    flex-shrink: 0;
+    cursor: pointer;
+    accent-color: var(--accent);
+}
+.channel-filter-name {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--ink);
+    white-space: nowrap;
+}
+.channel-filter-item:has(input:not(:checked)) {
+    background: rgba(31, 41, 51, 0.05);
+    border-color: rgba(31, 41, 51, 0.15);
+}
+.channel-filter-item:has(input:not(:checked)) .channel-filter-name {
+    color: var(--muted);
+    text-decoration: line-through;
 }
 .field { display: grid; gap: 8px; }
 .field-label { font-weight: 700; }

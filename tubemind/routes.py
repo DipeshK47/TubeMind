@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fasthtml.common import FileResponse, JSONResponse, Link, RedirectResponse, Request, Script, fast_app
+from fasthtml.common import FileResponse, HTMLResponse, JSONResponse, Link, RedirectResponse, Request, Script, fast_app
 
 from tubemind.auth import (
     current_user,
@@ -316,6 +316,35 @@ def create_app():
             workspace = app_state.build_workspace(board_id or int(user.get("active_board_id") or 0) or None, warning=str(exc))
         active_board_id = int(workspace.active_board.get("id", 0) or 0) if workspace.active_board else None
         return render_workspace(workspace, {**user, "active_board_id": active_board_id})
+
+    @rt("/api/boards/{board_id}/regenerate", methods=["POST"])
+    async def api_regenerate_board(request: Request, session, board_id: int):
+        """Re-answer all notes in the active session with updated channel filters."""
+
+        user = authenticated_user(session)
+        if not user:
+            return RedirectResponse("/login", status_code=303)
+        board = get_board_for_user(user["id"], board_id)
+        if not board:
+            return RedirectResponse("/", status_code=303)
+        form = await request.form()
+        session_id_raw = str(form.get("session_id", "") or "").strip()
+        session_id = int(session_id_raw) if session_id_raw.isdigit() else None
+        blocked_channels = [
+            c.strip().casefold()
+            for c in str(form.get("blocked_channels", "") or "").split(",")
+            if c.strip()
+        ]
+        app_state = await get_user_app(user["id"])
+        try:
+            await app_state.regenerate_session_notes(board_id, session_id, blocked_channels=blocked_channels)
+        except Exception as exc:
+            workspace = app_state.build_workspace(board_id, active_session_id=session_id, warning=str(exc))
+            return render_workspace(workspace, {**user, "active_board_id": board_id})
+        # HX-Redirect forces a full page navigation to the board so the result
+        # always lands on the correct board regardless of where the user navigated
+        # while regeneration was running.
+        return HTMLResponse("", headers={"HX-Redirect": f"/boards/{board_id}"})
 
     @rt("/api/boards/{board_id}", methods=["DELETE"])
     async def api_delete_board(request: Request, session, board_id: int):

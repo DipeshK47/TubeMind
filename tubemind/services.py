@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -20,6 +21,7 @@ from openai import AsyncOpenAI
 from youtube_transcript_api import NoTranscriptFound, TooManyRequests, YouTubeRequestFailed, YouTubeTranscriptApi
 
 from tubemind.auth import (
+    clear_session_notes,
     create_board,
     create_board_note,
     create_session,
@@ -199,8 +201,14 @@ class TubeMindApp:
             working_dir=str(working_dir),
             domain=os.environ.get(
                 "FAST_GRAPHRAG_DOMAIN",
-                "Analyze YouTube transcript evidence for a board-scoped research question. "
-                "Identify videos, creators, products, claims, comparisons, and supporting evidence that help answer the user.",
+                "You are a research assistant synthesizing YouTube transcript evidence for a user's research question. "
+                "Always provide detailed, multi-paragraph answers. Include specific claims, direct evidence from transcripts, "
+                "comparisons between creators or products, concrete examples, and actionable insights. "
+                "Never give a vague or one-sentence answer — explain your reasoning and cite multiple supporting points from the transcripts. "
+                "When the user asks for a list, a top-N ranking, bullet points, or any enumerated set of items, "
+                "you MUST produce every item as a numbered or bulleted entry. Never truncate a list with phrases like "
+                "'and more', 'etc.', or '...'. If asked for a top 10, write all 10 items. If asked for a list, write every item. "
+                "Identify videos, channels, creators, products, features, tradeoffs, recommendations, and supporting evidence.",
             ),
             example_queries=example_queries,
             entity_types=entity_types,
@@ -245,18 +253,34 @@ class TubeMindApp:
         resolved_session_id: int | None = None
         notes: list[dict] = []
 
+        channels: list[dict] = []
         if active_board:
             board_id_int = int(active_board["id"])
             sessions = list_sessions(board_id_int)
             if active_session_id:
                 resolved_session_id = active_session_id
-            elif sessions:
-                resolved_session_id = int(sessions[0]["id"])
+            else:
+                # Find the session that has the most recently created note so
+                # switching away and back always lands on the last active thread.
+                all_notes = list_board_notes(board_id_int)
+                if all_notes:
+                    latest = max(all_notes, key=lambda n: int(n.get("created_at") or 0))
+                    note_sid = latest.get("session_id")
+                    resolved_session_id = int(note_sid) if note_sid else None
+                elif sessions:
+                    resolved_session_id = int(sessions[0]["id"])
             if resolved_session_id:
                 notes = list_session_notes(board_id_int, resolved_session_id)
             else:
-                # Fallback: show all notes for legacy boards with no sessions yet
+                # Fallback: legacy notes with no session_id
                 notes = list_board_notes(board_id_int)
+            seen_channels: set[str] = set()
+            for v in list_board_videos(board_id_int):
+                ct = str(v.get("channel_title") or "").strip()
+                if ct and ct not in seen_channels:
+                    seen_channels.add(ct)
+                    channels.append({"channel_title": ct})
+            channels.sort(key=lambda x: x["channel_title"].casefold())
 
         return BoardWorkspace(
             boards=boards,
@@ -266,6 +290,7 @@ class TubeMindApp:
             warning=warning,
             sessions=sessions,
             active_session_id=resolved_session_id,
+            channels=channels,
         )
 
     async def create_empty_board(self) -> BoardWorkspace:
@@ -310,7 +335,13 @@ class TubeMindApp:
             if not fit["is_fit"]:
                 return self.build_workspace(board_id_int, active_session_id=resolved_session_id, warning=fit["warning"])
 
-        update_board(board_id_int, status="working", updated_at=now_ms())
+        update_board(
+            board_id_int,
+            status="working",
+            status_message=question_text,
+            blocked_channels=json.dumps(blocked_channels or []),
+            updated_at=now_ms(),
+        )
         runtime = await self._get_board_runtime(board_id_int)
         initial = await self._query_board(board_id_int, runtime, question_text, mode, allow_empty=True)
         plan = await self._plan_research(board, notes, question_text, initial)
@@ -360,6 +391,256 @@ class TubeMindApp:
         update_board(board_id_int, status="ready", last_question_at=now_ms(), updated_at=now_ms())
         await self._refresh_board_summary(board_id_int)
         return self.build_workspace(board_id_int, active_session_id=resolved_session_id, notice="Added a new note to the board.")
+
+    async def regenerate_session_notes(
+        self,
+        board_id: int,
+        session_id: int | None,
+        blocked_channels: list[str] | None = None,
+    ) -> BoardWorkspace:
+        """Re-answer every note in a session directly from the existing corpus.
+
+        Bypasses the full answer_question pipeline (no topic-fit check, no
+        corpus expansion, no quality gates) so regeneration cannot fail due to
+        YouTube API errors, topic mismatch false-positives, or expansion limits.
+        The board corpus is already indexed; we only need fresh RAG answers.
+        """
+
+        board = get_board_for_user(self.user_id, board_id)
+        if not board:
+            raise ValueError("Board not found.")
+
+        # Resolve session_id from the most recent note when not explicitly provided
+        if not session_id:
+            all_notes = list_board_notes(board_id)
+            if all_notes:
+                latest = max(all_notes, key=lambda n: int(n.get("created_at") or 0))
+                note_sid = latest.get("session_id")
+                session_id = int(note_sid) if note_sid else None
+        if not session_id:
+            return self.build_workspace(board_id, notice="No active session found to regenerate.")
+
+        saved = clear_session_notes(board_id, session_id)
+        if not saved:
+            return self.build_workspace(board_id, active_session_id=session_id, notice="No notes to regenerate.")
+
+        # Persist the channel filter so it survives page reloads.
+        update_board(board_id, blocked_channels=json.dumps(blocked_channels or []))
+
+        # Build blocked_video_ids from the board's corpus so we can detect
+        # which saved note chunks came from blocked channels.
+        blocked_video_ids: set[str] = set()
+        if blocked_channels:
+            blocked_lower = {c.casefold() for c in blocked_channels}
+            for v in list_board_videos(board_id):
+                if str(v.get("channel_title") or "").casefold() in blocked_lower:
+                    blocked_video_ids.add(str(v.get("video_id") or ""))
+
+        update_board(board_id, status="working", status_message="Regenerating notes…", updated_at=now_ms())
+
+        # If more than half the indexed videos are from blocked channels the
+        # graph structure itself is polluted — rebuild the corpus from scratch
+        # using only the allowed transcripts.
+        all_board_videos = list_board_videos(board_id)
+        total_videos = len(all_board_videos)
+        blocked_count = sum(
+            1 for v in all_board_videos
+            if str(v.get("video_id") or "") in blocked_video_ids
+        )
+        corpus_rebuilt = total_videos > 0 and blocked_count > total_videos / 2
+        if corpus_rebuilt:
+            set_board_progress(board_id, f"Rebuilding knowledge graph — removing {blocked_count} excluded video{'s' if blocked_count != 1 else ''}…")
+            runtime = await self._rebuild_board_corpus(board_id, blocked_video_ids)
+        else:
+            runtime = await self._get_board_runtime(board_id)
+
+        total = len(saved)
+        failures = 0
+
+        for idx, item in enumerate(saved, start=1):
+            question_text = str(item.get("question") or "").strip()
+            mode = str(item.get("query_mode") or DEFAULT_QUERY_MODE)
+            old_chunks: list[dict[str, Any]] = item.get("chunks") or []
+            if not question_text:
+                continue
+            set_board_progress(board_id, f"Regenerating note {idx} of {total}…")
+            try:
+                # After a full corpus rebuild the graph only contains allowed
+                # videos, so we can query directly without any post-filtering.
+                # Only do chunk-level filtering when we kept the original graph.
+                has_blocked = (not corpus_rebuilt) and bool(blocked_video_ids) and any(
+                    str(c.get("video_id") or "") in blocked_video_ids for c in old_chunks
+                )
+
+                if has_blocked:
+                    # Filter the saved chunks to remove blocked-channel entries.
+                    clean_chunks = [c for c in old_chunks if str(c.get("video_id") or "") not in blocked_video_ids]
+
+                    # If too few clean chunks remain, re-query the graph and filter
+                    # its context as well, then merge with what we already have.
+                    if len(clean_chunks) < 2:
+                        result = await self._query_board(board_id, runtime, question_text, mode, allow_empty=True)
+                        rag_chunks = [
+                            c for c in result.get("chunks", [])
+                            if str(c.get("video_id") or "") not in blocked_video_ids
+                        ]
+                        # Merge, deduplicate by chunk_id
+                        seen_ids: set[str] = {str(c.get("chunk_id") or "") for c in clean_chunks}
+                        for c in rag_chunks:
+                            cid = str(c.get("chunk_id") or "")
+                            if cid not in seen_ids:
+                                clean_chunks.append(c)
+                                seen_ids.add(cid)
+
+                    # Fall back to keyword search from non-blocked transcripts if still sparse.
+                    if len(clean_chunks) < 2:
+                        non_blocked_vids = [
+                            v for v in list_board_videos(board_id)
+                            if str(v.get("video_id") or "") not in blocked_video_ids
+                        ]
+                        clean_chunks = self._find_relevant_chunks(runtime, non_blocked_vids, question_text)
+
+                    answer_text = await self._synthesize_from_chunks(question_text, clean_chunks, board)
+                    chunks = clean_chunks
+                else:
+                    # Note has no blocked content — re-query for a fresh answer but
+                    # keep context from the original corpus unchanged.
+                    result = await self._query_board(board_id, runtime, question_text, mode, allow_empty=False)
+                    answer_text = str(result.get("answer") or "").strip()
+                    chunks = result.get("chunks", [])
+
+                note = create_board_note(
+                    board_id=board_id,
+                    question=question_text,
+                    answer=answer_text or "TubeMind found evidence but could not synthesize a final answer.",
+                    query_mode=mode,
+                    session_id=session_id,
+                )
+                replace_note_chunks(int(note["id"]), chunks)
+            except Exception:
+                failures += 1
+
+        update_board(board_id, status="ready", updated_at=now_ms())
+        await self._refresh_board_summary(board_id)
+        regenerated = total - failures
+        notice = f"Regenerated {regenerated} of {total} note{'s' if total != 1 else ''}."
+        if failures:
+            notice += f" {failures} could not be re-answered from the current corpus."
+        return self.build_workspace(board_id, active_session_id=session_id, notice=notice)
+
+    async def _rebuild_board_corpus(self, board_id: int, blocked_video_ids: set[str]) -> BoardRuntime:
+        """Wipe the RAG graph and re-index only non-blocked transcripts.
+
+        Called when more than half of a board's indexed videos are from blocked
+        channels. Filtering at query time is not enough in that case — the graph
+        structure itself was built from those videos, so semantic links from the
+        blocked content pollute every answer. A clean rebuild ensures the graph
+        only knows about allowed sources.
+        """
+
+        with self.lock:
+            old_runtime = self._board_runtimes.pop(board_id, None)
+
+        # Finalize the old RAG instance before wiping its storage.
+        if old_runtime is not None and old_runtime.rag is not None:
+            try:
+                finalize = getattr(old_runtime.rag, "finalize_storages", None)
+                if finalize:
+                    await self._run_coro_on_rag_loop(finalize())
+            except Exception:
+                pass
+
+        board_root = self._boards_root / str(board_id)
+        working_dir = board_root / "rag_storage"
+        transcript_dir = board_root / "transcripts"
+
+        # Wipe the graph storage but keep transcript JSON files — they are the
+        # raw source-of-truth and re-indexing reads from them directly.
+        if working_dir.exists():
+            shutil.rmtree(working_dir)
+        working_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build a fresh RAG instance against the empty storage directory.
+        new_rag = await self._run_coro_on_rag_loop(self._create_rag(working_dir))
+        runtime = BoardRuntime(board_id=board_id, working_dir=working_dir, transcript_dir=transcript_dir, rag=new_rag)
+
+        # Re-index every non-blocked video whose transcript artifact is on disk.
+        board_videos = list_board_videos(board_id)
+        documents: list[str] = []
+        meta: list[dict[str, Any]] = []
+        for video in board_videos:
+            video_id = str(video.get("video_id") or "").strip()
+            if not video_id or video_id in blocked_video_ids:
+                continue
+            artifact_path = transcript_dir / f"{video_id}.json"
+            if not artifact_path.exists():
+                continue
+            try:
+                artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+                clean_text = str(artifact.get("clean_text") or "").strip()
+                if clean_text:
+                    documents.append(clean_text)
+                    meta.append({
+                        "doc_id": f"youtube:{video_id}",
+                        "video_id": video_id,
+                        "title": str(video.get("title") or ""),
+                        "url": str(video.get("url") or ""),
+                        "thumbnail": str(video.get("thumbnail") or ""),
+                        "channel_title": str(video.get("channel_title") or ""),
+                    })
+            except Exception:
+                continue
+
+        if documents:
+            await self._run_coro_on_rag_loop(runtime.rag.async_insert(documents, metadata=meta, show_progress=False))
+
+        with self.lock:
+            self._board_runtimes[board_id] = runtime
+        return runtime
+
+    async def _synthesize_from_chunks(self, question: str, chunks: list[dict[str, Any]], board: dict[str, Any]) -> str:
+        """Generate an answer directly from a filtered set of transcript chunks.
+
+        Used during regeneration when blocked-channel chunks are removed from the
+        RAG result. The RAG's own answer is discarded because it was synthesized
+        from the full unfiltered corpus; this call produces a fresh answer using
+        only the allowed evidence.
+        """
+
+        if not chunks:
+            return ""
+        board_topic = str(board.get("topic_anchor") or board.get("title") or "").strip()
+        context_parts = []
+        for chunk in chunks[:8]:
+            title = str(chunk.get("title") or "Unknown source").strip()
+            content = str(chunk.get("content") or "").strip()[:600]
+            if content:
+                context_parts.append(f"Source: {title}\n{content}")
+        if not context_parts:
+            return ""
+        context = "\n\n---\n\n".join(context_parts)
+        try:
+            response = await self._openai.responses.create(
+                model=self._llm_model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            f"You are a research assistant synthesizing YouTube transcript evidence about: {board_topic}. "
+                            "Answer the question using ONLY the provided transcript excerpts. "
+                            "Be detailed and comprehensive — multiple paragraphs with specific evidence, comparisons, and examples. "
+                            "When asked for a list, produce every item numbered or bulleted. Never truncate with 'etc.' or 'and more'."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Question: {question}\n\nTranscript excerpts:\n\n{context}",
+                    },
+                ],
+            )
+            return str(getattr(response, "output_text", "") or "").strip()
+        except Exception:
+            return ""
 
     async def _check_retrieval_quality(
         self,

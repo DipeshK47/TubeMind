@@ -127,3 +127,4 @@ class BoardWorkspace:
     active_session_id: int | None = None
     notice: str = ""
     warning: str = ""
+    channels: list[dict] = field(default_factory=list)

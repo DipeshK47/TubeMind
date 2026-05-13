@@ -50,6 +50,7 @@ if boards_table not in db.t:
             topic_anchor=str,
             status=str,
             status_message=str,
+            blocked_channels=str,
             created_at=int,
             updated_at=int,
             last_question_at=int,
@@ -60,6 +61,8 @@ else:
     _board_cols = {col[1] for col in db.execute("PRAGMA table_info(boards)").fetchall()}
     if "status_message" not in _board_cols:
         db.execute("ALTER TABLE boards ADD COLUMN status_message TEXT")
+    if "blocked_channels" not in _board_cols:
+        db.execute("ALTER TABLE boards ADD COLUMN blocked_channels TEXT DEFAULT '[]'")
 
 board_sessions_table = db.t.board_sessions
 if board_sessions_table not in db.t:
@@ -642,6 +645,33 @@ def list_note_chunks(note_id: int) -> list[dict[str, Any]]:
 
     rows = board_note_chunks_table.rows_where("note_id = ?", [note_id], order_by="chunk_order ASC")
     return [dict(row) for row in rows]
+
+
+def clear_session_notes(board_id: int, session_id: int) -> list[dict[str, Any]]:
+    """Delete all notes in a session and return their questions, modes, and chunks.
+
+    The chunks are read before deletion so the caller can inspect which source
+    videos each note referenced — used during regeneration to detect and filter
+    blocked-channel content without re-querying the RAG for clean notes.
+    """
+
+    notes = list_session_notes(board_id, session_id)
+    saved = []
+    for n in notes:
+        if not n.get("question"):
+            continue
+        saved.append({
+            "question": str(n.get("question") or ""),
+            "query_mode": str(n.get("query_mode") or ""),
+            "chunks": list_note_chunks(int(n["id"])),
+        })
+    for note in notes:
+        note_id = int(note["id"])
+        board_note_chunks_table.delete_where("note_id = ?", [note_id])
+        for row in list(board_queries_table.rows_where("note_id = ?", [note_id])):
+            board_queries_table.delete(row["id"])
+        board_notes_table.delete(note_id)
+    return saved
 
 
 def list_board_videos(board_id: int) -> list[dict[str, Any]]:

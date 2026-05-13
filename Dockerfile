@@ -8,9 +8,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
-COPY vendor ./vendor
 COPY static ./static
 COPY tubemind ./tubemind
+COPY vendor ./vendor
 
 RUN uv sync --frozen --no-dev
 

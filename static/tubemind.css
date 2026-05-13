@@ -1,6 +1,15 @@
 :root {
     --pico-font-family: "Source Sans 3", sans-serif;
     --pico-font-size: 106%;
+    /* Override pico's own color variables so headings/body are always dark */
+    --pico-color: #0d1117;
+    --pico-h1-color: #0d1117;
+    --pico-h2-color: #0d1117;
+    --pico-h3-color: #0d1117;
+    --pico-h4-color: #0d1117;
+    --pico-contrast: #0d1117;
+    --pico-secondary: #4b5563;
+    --pico-muted-color: #4b5563;
     --ink: #0d1117;
     --muted: #4b5563;
     --line: rgba(31, 41, 51, 0.12);
@@ -33,7 +42,12 @@ body {
 }
 
 a { color: var(--accent-strong); }
-h1, h2, h3 { font-family: "Space Grotesk", sans-serif; letter-spacing: -0.03em; }
+h1, h2, h3, h4 {
+    font-family: "Space Grotesk", sans-serif;
+    letter-spacing: -0.03em;
+    color: var(--ink);
+}
+p, li, span, label, pre, blockquote { color: inherit; }
 
 .app-shell {
     min-height: 100vh;
@@ -76,9 +90,46 @@ h1, h2, h3 { font-family: "Space Grotesk", sans-serif; letter-spacing: -0.03em; 
 
 .sidebar-head { display: grid; gap: 6px; }
 .sidebar-brand { font-family: "Space Grotesk", sans-serif; font-size: 1.3rem; font-weight: 700; }
-.sidebar-copy, .sidebar-board-copy, .field-help, .board-summary, .empty-copy, .detail-meta, .detail-muted, .note-meta, .user-name, .login-copy {
+.sidebar-copy, .sidebar-board-copy, .field-help, .board-summary, .empty-copy,
+.detail-meta, .detail-muted, .note-meta, .user-name, .login-copy {
     color: var(--muted);
 }
+
+/* Force dark on all title / body text that pico may wash out */
+.board-title,
+.detail-title,
+.note-question,
+.detail-section-title,
+.sidebar-board-title,
+.board-kicker,
+.field-label,
+.back-link,
+.detail-query,
+.chunk-video-link,
+.chunk-open-link,
+.search-settings-toggle {
+    color: var(--ink);
+}
+
+.detail-answer,
+.detail-answer p,
+.detail-answer li,
+.detail-answer strong,
+.detail-answer em,
+.detail-answer h1,
+.detail-answer h2,
+.detail-answer h3,
+.chunk-copy,
+.note-answer-text {
+    color: var(--ink);
+}
+
+.detail-answer blockquote,
+.detail-answer blockquote p {
+    color: var(--muted);
+}
+
+.detail-query-reason { color: var(--muted); }
 
 .sidebar-create-btn,
 .primary-btn,
@@ -208,6 +259,8 @@ input {
     box-shadow: none;
     color: var(--ink);
 }
+textarea::placeholder,
+input::placeholder { color: var(--muted); }
 textarea:focus,
 select:focus,
 input:focus {

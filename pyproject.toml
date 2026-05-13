@@ -1,0 +1,32 @@
+[project]
+name = "tubemind"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fast-graphrag>=0.0.5",
+    "lightrag-hku>=1.4.10",
+    "monsterui>=1.0.44",
+    "openai>=2.24.0",
+    "python-dotenv>=1.2.1",
+    "python-fasthtml>=0.12.47",
+    "youtube-transcript-api==0.6.2",
+    "yt-dlp>=2026.3.3",
+]
+
+[tool.uv]
+override-dependencies = [
+    "openai>=2.24.0",
+    "hnswlib==0.8.0",
+]
+prerelease = "allow"
+
+[tool.uv.sources]
+hnswlib = { path = "vendor/hnswlib-dist-shim" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+]
